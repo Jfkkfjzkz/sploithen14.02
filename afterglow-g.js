@@ -879,11 +879,14 @@ function readFromUSB(filename) {
 }
 
 async function loadEnabler(url, k, kbase, room) {
-  let blob = readFromUSB("payload.bin");
+  /* the page's named asset wins over a stick in the console; USB is the
+     fallback when the server did not hand the file over */
+  let blob = url ? await fetchBytes(url, "e") : null;
   if (blob) {
-    say("[e] " + blob.length + " bytes from USB");
+    say("[e] " + blob.length + " bytes for " + url);
   } else {
-    blob = await fetchBytes(url, "e");
+    blob = readFromUSB("payload.bin");
+    if (blob) say("[e] " + blob.length + " bytes from USB");
   }
   if (blob === null || !blob) return false;
   if (blob.length === GH.nlOff + GH.nlLen) {
@@ -1024,11 +1027,17 @@ const RAW_STEPS = [
   [0x391,  "goldhen_is_loaded"],
   [0x1025, "patch_kernel_installer"],
   [0xf2f,  "print_banner"],
-  [0x1841, "noop probe (is_kernel_pointer), carries M_TEMP override"],
+  [0x1841, "noop probe (is_kernel_pointer)"],
   [0x1829, "IMP_MALLOC wrapper, alloc 0x1000", { rdi: 0x1000 }],
   [0x1807, "IMP_KMEM_ALLOC wrapper, alloc 0x1000", { rdi: 0x1000 }],
   [0x1093, "load_and_start_kpayload: FTP/klog/BinLoader"],
 ];
+
+/* The malloc wrapper at 0x182d is `mov rsi,[rip+disp32]` (M_TEMP), then
+   jmp malloc. The .data slot moves between builds while the code does not;
+   the immediate fix lives in the ksdk import table at 0x3490, which is code
+   and identical in both. Release ends its file at 0x47455 with the slot at
+   0x47450, the debug payload.bin carries 0x48c3b. */
 
 async function loadRawKernel(url, k, kbase, room, vorab) {
   const c = host();
@@ -1064,6 +1073,10 @@ async function loadRawKernel(url, k, kbase, room, vorab) {
     c.p.write8(plus(buf, o), v(lo >>> 0, hi >>> 0));
   }
   say("[p] " + blob.length + " loader bytes staged at " + text(buf));
+  /* a blob longer than GH.tor runs through the gate page in the staging
+     buffer; re-emit the gate and probe stub after the copy */
+  codeAt(buf, GH.tor).hex("4831c0").hex("4989ca").hex("0f05").hex("c3");
+  codeAt(buf, GH.tram + 0x200).hex("c3");
   /* DIAGNOSTIC: patch_kernel_installer (0x1025) froze the console. Its only
      unproven write is *IMP_DISABLE_CONSOLE_OUTPUT = 0 -- mov rdx,[rip+0x463e9];
      mov byte [rdx],0 at image 0x1068 (10 bytes). The five installer text patches
@@ -1077,7 +1090,15 @@ async function loadRawKernel(url, k, kbase, room, vorab) {
      imports) or inside the kpayload's entry (GoldHEN's 14.02 port). With the
      call gone eax stays 0 and [5] returns clean. */
   for (let o = 0; o < 4; o++) wr1(plus(buf, 0x1136 + o), 0x90);
-  say("[p] diag: NOP'd console-output write (0x1068) and kpayload entry call (0x1136)");
+  /* M_TEMP fix in the ksdk TABLE, not a runtime global: patch the q[14]
+     immediate's high dword (image 0x3490, out[29]) from 0x2be1f0 -- which is
+     code -- to 0x1520d00, the data zone the kernel's own malloc callers use
+     171 times. resolve_imports then computes M_TEMP = kbase+0x1520d00 for
+     either loader build, whatever the .data layout. */
+  wr1(plus(buf, 0x3490), 0x00); wr1(plus(buf, 0x3491), 0x0d);
+  wr1(plus(buf, 0x3492), 0x52); wr1(plus(buf, 0x3493), 0x01);
+  say("[p] diag: console-output write NOP'd (0x1068), kpayload entry call NOP'd (0x1136)");
+  say("[p] diag: M_TEMP table immediate -> kbase+0x1520d00 (0x3490)");
 
   const t = plus(kbase, GH.rvaPad);
   const tram = { n: 0 };
@@ -1096,13 +1117,14 @@ async function loadRawKernel(url, k, kbase, room, vorab) {
   say("[p] ---> calling runPatchSet");
   if (!(await runPatchSet(room))) return false;
   say("[p] patchset ok ---> calling paddingRW");
-  if (!paddingRW(k, kbase)) { say("[p] stopping: padding would stay read only"); return false; }
+  const dmapPad = paddingRW(k, kbase);
+  if (!dmapPad) { say("[p] stopping: padding would stay read only"); return false; }
 
   /* whole loader image (loader + zlib + trailer) into the padding, PIC */
   tram.n = 0;
   wpOff();
   hex("48be"); q64(buf);
-  hex("48bf"); q64(t);
+  hex("48bf"); q64(dmapPad);
   hex("b9"); i32(blob.length);
   hex("fc"); hex("f3a4");
   wpOn();
@@ -1117,15 +1139,6 @@ async function loadRawKernel(url, k, kbase, room, vorab) {
     markClear();
     tram.n = 0;
     wpOff();
-    /* M_TEMP fix: the port's ksdk out[29] resolves M_TEMP to 0x2be1f0, which
-       is code, not a malloc_type -- so malloc(size, M_TEMP, 2) derefs code and
-       panics. The kernel's own malloc callers use the data zone at 0x1520d00
-       (171 callers). Overwrite the loader's M_TEMP global (image 0x47550) with
-       kbase+0x1520d00 before the malloc probe so the type is a real struct. */
-    if (rva === 0x1841) {
-      wr8(plus(buf, 0x47550), plus(kbase, 0x1520d00));
-      say("[p] diag: M_TEMP overridden -> kbase+0x1520d00 (was 0x2be1f0/code)");
-    }
     const opt = RAW_STEPS[n][2] || {};
     if (opt.rdi !== undefined) { hex("bf"); i32(opt.rdi); }   /* mov edi, imm32 */
     else { hex("31ff"); }                                     /* xor edi,edi */

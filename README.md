@@ -19,6 +19,7 @@ Nothing is installed on the console. The pages are static files.
 
 ```sh
 ./serve.sh                      # port 8000, or AFTERGLOW_PORT=8080 ./serve.sh
+node serve.js                   # same rules; use this on a host without python3
 ```
 
 Open `http://<host>:8000/` in the console's browser, pick **ps4-hen** or
@@ -33,11 +34,22 @@ off again with nobody watching.
 
 | File | What it is |
 |---|---|
+| `goldhen-1402.bin` | GoldHEN 14.02 release loader — 291,925-byte raw payload (leading `e9`), the default the page launches |
+| `payload.bin` | debug build of the same loader, 297,931 bytes, kept for the gated step log |
 | `hen.bin` | ps4-hen `pre-release-main-182`, **already patched** (see below) |
 | `goldhen.bin` | GoldHEN, included with the author's permission |
 | `patchset.bin` | 641 bytes of kernel patches GoldHEN expects to find |
 | `afterglow.js`, `patchset.bin` | this work |
 | `jb.js`, `core.js`, `mem.js`, `int64.js`, `ps4_offsets.js` | from the raw13g host, trimmed |
+
+The entry pages (`/`, `go.html`, `go-s.html`) redirect to
+`launch.html?...&afterglow=run&mode=goldhen&payload=goldhen-1402.bin`, so the
+default run is afterglow's gated raw-loader path with the release binary. The
+selector is content-based (`loadEnabler`): a file of exactly 964,440 bytes takes
+the composite patch chain, a leading `e9` takes the raw loader. `mode=kpstep`
+still drives the inflated kpayload one call at a time. The M_TEMP slot is read
+out of the loader's own `mov rsi,[rip+disp32]` at `0x182d`, so both builds work
+without a per-build table.
 
 ### ps4-hen is patched here
 
