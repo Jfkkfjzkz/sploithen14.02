@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import re, sys, time, urllib.parse
-LOG = "/tmp/afterglow-1402-serve.log"
+LOG = "/home/mc/ag1402/serve.log"
 f = open(LOG, "r", errors="replace")
 f.seek(0, 2)
 pat = re.compile(r"ag_log\?m=([^ ]+)")

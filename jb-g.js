@@ -56,7 +56,7 @@ const FROM_LANDING = (function () {
     const here = location.pathname.replace(/[^/]*$/, "");
     if (cameFrom !== here) return false;
     const file = r.pathname.slice(cameFrom.length);
-    return file === "" || file === "index.html";
+    return file === "" || file === "index.html" || /^go(-[a-z0-9]+)?\.html$/.test(file);
   } catch (e) {
     return false;
   }
@@ -1011,7 +1011,7 @@ let allDone = false,
          (afterglow=probe) fires no trigger and patches nothing, so a restored
          page may run that. */
       try {
-        const ag = await import("./afterglow-g.js?v=1402s");
+        const ag = await import("./afterglow-g.js?v=1402zh");
         // Exactly what afterglow reaches for, counted rather than guessed.
         const agCtx = {
           p: p, callAddr: callAddr, bufAddr: bufAddr, errno: errno,
