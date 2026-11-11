@@ -1,88 +1,97 @@
-Diagnostic build 1402zl. Payload binaries and memory offsets are unchanged;
-only afterglow-g.js and the entry pages differ from 1402zk. This is one new
-ring-0 call per boot, by design.
+Diagnostic build 1402zm. Payload binaries and memory offsets are unchanged;
+only afterglow-g.js and the entry pages differ from 1402zl. This is still one
+new ring-0 call per boot, by design.
 
 Why this build exists
-  The 1402zk run printed
-      [kp] gate heartbeat 0xffffffffccf50000, firing step 1 next
-  and the console died ~2 s later, with the SYNC line never painted. Since
-  say() paints synchronously and nap() yields to the compositor, the death
-  happened either in the 300 ms idle nap after the heartbeat or during the
-  host-side trampoline build -- before fire(), not inside the payload.
+  The 1402zl run printed
+      [kp] tram built (82 bytes), firing now
+  and the console died inside the next 250 ms, before the SYNC line. Nothing
+  of ours runs in that window: the tram is built from userland primitives, and
+  the next ring-0 act would have been the payload call itself. So the last
+  build died while the page was merely idle -- right after the staging burst.
 
-  The prime suspect is a real port bug now proven from our own 14.02 dump:
-  the [7b] resolver searched the shift list for a confirming instruction, and
-  when it found none it still let [8] write the 14.00 bytes at the 14.02
-  offset. Six sites have no branch there at all, so those writes landed
-  mid-instruction:
-      0x1b7504  `90 e9` inside a `lea`       -> wild jmp
-      0x628684  `eb 00` inside a `lea`       -> bzero buffer pointer corrupted
-      0x1b7a53  displacement tail of `je` at 0x1b7a4f -> wild jump
-  A system path that touches dlsym/load_prx or self-verification after the
-  chain completes would then jump into garbage -- exactly the kind of death
-  that arrives a beat after the last painted line.
+  The burst is the suspect. The 642,888-byte copy and the .bss clear ran about
+  100,000 times, and each iteration built a fresh int64 for the address and
+  another for the value. This int64 class installs ~12 closures on every
+  instance, so the burst left millions of short-lived cells behind. The first
+  idle collection after that garbage is exactly when 1402zl stopped painting.
+  The alternative is an asynchronous kernel path, which no build has caught in
+  the act because the page always died before the payload call could report.
+
+  So 1402zm removes the garbage, fires step 1 at the earliest point the screen
+  can show it, and puts a clock on the screen that keeps time across a freeze.
+  One way or the other, the next run names its cause.
 
 What changed in afterglow-g.js
-  - the patch resolver now builds applyList/skipped:
-      * a site already equal to the wanted bytes is applied;
-      * a site whose live instruction is a safe jcc is applied -- for "eb"
-        any short jcc (0x70..0x7f) of the same length, for "eb04" the same
-        short jcc with displacement 0x04, for "90e9" any 0f-prefixed jcc --
-        because forcing a branch only requires landing on a branch;
-      * otherwise the shift list is searched (16..1280 bytes) for a site
-        that does confirm; a hit is applied at the shifted address;
-      * otherwise the site is SKIPped, never written, and its 12 live bytes
-        are printed: [7b] SKIP <name> @0x<off> live <hex>.
-  - [8] verifies applyList only and prints "N of N confirmed kernel patches
-    in place". N can be less than 15; that is the fix, not a failure.
-  - two paint checkpoints were inserted so the silent stretch after the gate
-    heartbeat is split into named windows:
-      [kp] idle window spent, building tram      (+ 250 ms nap)
-      [kp] tram built (<n> bytes), firing now    (+ 250 ms nap)
-  - unchanged from 1402zk: probe bypass (image+0x98488 preset to 0x57a,
-    0x116be called directly with edi=0x57a), no patchset.bin, no paddingRW
-    pde write, no planted string, no kernel-padding stack switch, payload on
-    the syscall's own kernel stack, KP_MAX_STEPS=1, exact step-1 checks
-    (rc=0, version word 0x57a, table[0] == kbase+0x1c0).
+  - Zero-garbage staging. Both loops mutate one cursor int64 and one word
+    int64 in place (add32inplace, direct low/hi writes). The primitive reads
+    low/hi and its aim/restore path allocates nothing, so the staging now
+    leaves the JS heap as it found it. Same bytes, same order, same result.
+  - Fire first, idle later. The 300+250+250+400 ms naps between the gate
+    heartbeat and the payload call are gone. The old "idle window spent" line
+    is gone with them. After the heartbeat the tram is built straight away,
+    the heartbeat / tram / SYNC lines are painted in one 120 ms frame, and the
+    call goes out. rc and the table check are painted immediately after the
+    return. The two 300 ms early naps (version preset, kernel base line) are
+    40 ms each; they only exist to let the log paint.
+  - Deadman clock. The status line above the log now reads
+        ALIVE <seconds> s  |  <phase>
+    and is repainted every 100 ms by its own timer, independently of the log.
+    Whatever it shows at a freeze is the last moment the main thread was
+    alive; the phase is the last say() that reached it. At the call it reads
+        ALIVE 8.41 s  |  FIRE [1] 0x116be
+  - The [7b] resolver now prints the live 14.02 bytes at the ORIGINAL 14.00
+    offset whenever it shifts a site, e.g.
+        [7b] self verification shifted +1152 -> 0x628b04  (0x628684 live ...)
+    That is how the next port tells whether the shift found the same
+    instruction or a lookalike.
+  - [7b] lines are forwarded to ag_log as well (the regex now covers 7b).
+  - Post-step idle is four 400 ms heartbeats instead of three 700 ms ones.
+  - Patch set and kernel state are UNCHANGED from 1402zl: 8 memcpy-family
+    "eb" sites, self verification applied at shifted 0x628b04, delayed panic
+    on suspend at 0x62926f, the five dlsym/load_prx sites still SKIPped.
+    Both panic-related sites remain applied exactly as last run.
 
-Expected on-screen order (1402zl)
+Expected on-screen order (1402zm)
   [kp] 642888 bytes inflated kpayload
   [kp] gate page executes in ring 3
   [kp] kpayload staged at 0x..., .bss cleared
   [kp] version word preset to 0x57a -- the ring-0 scan never runs
   [7b] N sites confirmed, M left untouched
   [7b] SKIP ... (one line per moved site, with live bytes)
+  [7b] ... shifted ... (original live ...) for any shifted site
   [8] N of N confirmed kernel patches in place
+  [9] jailbroken, uid 0
+  [10] kernel interface is live -- ... handles held open
+  [t] ... teardown lines, then "handles defused"
   [kp] kernel base 0x..., payload at 0x... -- patchset and padding pde skipped this build
-  [kp] gate heartbeat 0x..., firing step 1 next
-  [kp] idle window spent, building tram
-  [kp] tram built (<n> bytes), firing now
+  [kp] gate heartbeat 0x... -- tram and step 1 in one paint window
+  [kp] tram built (82 bytes), firing now
   [kp] SYNC entering [1] 0x116be init: import/offset tables (probe bypassed) (host stack)
   [kp] [1] rc=0 -- init: import/offset tables (probe bypassed)
   [kp] version word 0x57a, table[0] 0x... -- matches base+0x1c0
-  [kp] step 1 returned cleanly -- 1402zl stops the chain here on purpose
-  [kp] idle heartbeat 1 of 3 after step 1
-  [kp] idle heartbeat 2 of 3 after step 1
-  [kp] idle heartbeat 3 of 3 after step 1
+  [kp] step 1 returned cleanly -- 1402zm stops the chain here on purpose
+  [kp] idle heartbeat 1..4 of 4 after step 1
   [kp] still alive after the idle window -- step 1 is clean
-  [kp] 1402zl diagnostic build -- stopping before the debug-settings pass
+  [kp] 1402zm diagnostic build -- stopping before the debug-settings pass
 
-How to read the next crash (if there is one)
-  - last line "gate heartbeat ... firing step 1 next": death in the 300 ms
-    idle nap. The kernel is unstable without any payload call and with no
-    blind patch writes -- report it, this narrows the hunt to the gate itself.
-  - last line "idle window spent, building tram": death while writing the
-    trampoline/marker words from the host. The host primitive is the suspect.
-  - last line "tram built (...), firing now": death in the 250 ms window
-    before the syscall. Nothing new ran; that points at residual kernel state.
-  - last line "SYNC entering [1]": the first payload call faulted in ring 0.
-    Report the exact rc/mismatch line if one appears.
-  - death during "idle heartbeat 1..3": step 1 returned but left the kernel
-    unstable -- that points at the table contents, not at the call.
+  Everything from "tram built" to "SYNC" now paints in one frame, and the
+  status line keeps ticking through the idle that follows.
+
+How to read the next crash
+  - freeze with the clock at "FIRE [1] 0x116be" and SYNC on screen: the
+    payload call was entered and did not come back. That is a ring-0 fault in
+    the payload; the last log line names the step.
+  - clock stopped at an earlier phase: the page still dies during staging,
+    with no payload call made. The clock value says how long after the gate
+    it happened -- compare it with 1402zl's roughly 0.5 s after the heartbeat.
+  - clock still counting, no new log lines: the main thread is alive and
+    something else is stuck. Note the value and report it.
+  - rc=0 printed, then the console dies during the heartbeats: step 1
+    returned and the kernel went down afterwards; the four heartbeats bracket
+    the moment.
   - "table[0] ... MISMATCH": the fill did not run as expected; the printed
     value tells which base/offset arithmetic failed.
-  - a SKIP line with surprising live bytes is useful too: it pins down where
-    the 14.02 code moved relative to 14.00.
 
 Kernel-state interlock
   Before any trigger the run asks whether mprotect can add PROT_EXEC to a
@@ -97,4 +106,4 @@ Kernel-state interlock
                   Firing twice on a patched kernel panics the console.
 
 Do not use on a console you cannot afford to crash; test only with owner
-permission. Capture the full on-screen log.
+permission. Capture the full on-screen log, including the status line.

