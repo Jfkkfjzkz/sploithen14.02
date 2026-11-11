@@ -212,10 +212,11 @@ function updateRamBox() {
     heapText + " | " + coreText;
 }
 
+let ramTimer = 0;
 if (ramBox) {
   updateRamBox();
 
-  setInterval(
+  ramTimer = setInterval(
     updateRamBox,
     500,
   );
@@ -1011,7 +1012,15 @@ let allDone = false,
          (afterglow=probe) fires no trigger and patches nothing, so a restored
          page may run that. */
       try {
-        const ag = await import("./afterglow-g.js?v=1402zm");
+        /* Force a frame at the hand-off. The console's screen otherwise keeps
+           the jb stage's last line until the first afterglow timer runs, and
+           that timer is later than the first ring 0 shot. */
+        try {
+          const st = document.getElementById("state");
+          if (st) st.textContent = "handing over to afterglow...";
+        } catch (e) {}
+        await new Promise(function (ok) { setTimeout(ok, 150); });
+        const ag = await import("./afterglow-g.js?v=1402zo");
         // Exactly what afterglow reaches for, counted rather than guessed.
         const agCtx = {
           p: p, callAddr: callAddr, bufAddr: bufAddr, errno: errno,
@@ -1028,6 +1037,7 @@ let allDone = false,
       } catch (agError) {
         mark("AG-FAIL", agError && agError.message ? agError.message : String(agError));
       }
+      try { clearInterval(watchdog); clearInterval(ramTimer); } catch (e) {}
       allDone = true;
       finishUI(true);
       // Swap the address out. The browser restores the last one after a

