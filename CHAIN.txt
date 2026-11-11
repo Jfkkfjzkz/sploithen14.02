@@ -1,17 +1,35 @@
-afterglow 14.02 chain - working snapshot 2026-11-11 (diag rev 2)
+afterglow 14.02 chain - working snapshot 2026-11-11 (diag rev 3)
 ==================================================
-Cache version : 1402zi
+Cache version : 1402zk
 State         : kernel exploit WORKS on 14.02 (uid 0, kernel R/W, 15/15 patches,
-                handles defused, console stays alive). Debug Settings patch lands:
-                last clean kernel-only run printed "debug menu enabled".
-                kpayload step chain under test; see DIAGNOSTIC_NOTES.txt.
+                handles defused, syscall-11 gate live). The last run reached
+                "[kp] version probe aimed at 0x....11ff000" and then the console
+                died in the idle window that followed -- before any kpayload
+                call was fired. This build removes that redirect machinery and
+                tests one new thing: kpayload step 1, probe-free.
 
-Prime suspect for the step-chain crash (fixed in this build)
-  The 14.02 relayout left a hole: RELRO memsz ends at base+0x12ff000 and the RW
-  segment starts at base+0x1520000.  The kpayload's version probe reads
-  [base+0x1300000, base+0x2200000) byte by byte, so its first read is in that
-  hole -- a ring 0 read of an unmapped byte is a panic with no log.  This build
-  redirects the probe to a planted string in the unused RELRO tail.
+What 1402zk changes (details in DIAGNOSTIC_NOTES.txt)
+  - probe BYPASS instead of redirect: the word at image+0x98488 is preset to
+    0x57a in userland, so all 19 payload call sites of 0x115be early-out; the
+    table fill 0x116be is called directly with edi=0x57a. No ring-0 scan, so
+    the unmapped scan window at base+0x1300000 is never touched.
+  - patchset.bin, paddingRW (the pde write), the planted string and the
+    kernel-padding stack switch are all skipped in this build; the payload
+    call runs on the syscall's own kernel stack, 16-byte aligned.
+  - one new step per boot: KP_MAX_STEPS=1. After step 1 returns, the chain
+    stops on purpose and prints three idle heartbeats over ~2.6 s, so the next
+    screenshot shows whether the console survives the idle window.
+
+Kernel-state interlock
+  Before any trigger the run asks whether mprotect can add PROT_EXEC to a
+  writable mapping. A clean boot refuses it; after a successful run it is
+  accepted, and the run stops instead of firing twice into a patched kernel.
+  A page reload, a Rest Mode resume or a SceShellUI restart all keep the
+  patched kernel; only a full power-off clears it.
+
+  go-check.html   safe check only: prints "... PATCHED" or "... FRESH"
+                  with no trigger and no patches
+  go-force.html   opt-in bypass for a boot you know is clean (force=1)
 
 One armed run per boot. Full power cycle between attempts - a reload says
 "this kernel is already open / Not firing again".
@@ -29,5 +47,6 @@ Payloads
   hen.bin           500,448 B  composite image for the pthread path
 
 patchset.bin : 14.02 corrected, md5 3f9b0fe9d643b28b9ff5f9ac19e74598
+               NOT called by 1402zk (its 0x125xxx block is still a suspect)
 site         : serve from this folder, python3 server.py (port 1337,
                Cache-Control: no-store, /ag_log answers 200, log in serve.log)

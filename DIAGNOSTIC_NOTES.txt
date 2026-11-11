@@ -1,21 +1,66 @@
-Diagnostic build. Payload binaries and memory offsets are unchanged; only
-afterglow-g.js and patchset.bin differ from the previous zip.
+Diagnostic build 1402zk. Payload binaries and memory offsets are unchanged;
+only afterglow-g.js and the entry pages differ from the previous zip. This is
+one new ring-0 call per boot, by design.
 
-What changed
-  - timer yield after each stage's log line, so the screen paints it before the
-    ring 0 call that follows (a resolved promise does not repaint)
-  - runPatchSet logs before and after the syscall-11 gate call
-  - paddingRW logs every check and yields before the page-directory write
-  - kpayload .bss (>= 0x98380) zeroed as a real loader would; the flat copy had
-    left the section-name table there
-  - version probe redirect: the payload scans [base+0x1300000, base+0x2200000)
-    for "s/release_", but RELRO memsz ends at base+0x12ff000, so the first byte
-    it reads is unmapped. The build plants "s/release_14.02" at
-    base+0x11ff000 (unused RELRO tail, made RW+X by paddingRW) and patches the
-    scan to [0x11ff000, 0x11ff010). The patch is applied only after the two
-    payload instructions are byte-verified against their expected form.
-  - after step [1], version (0x98488), table pointer (0x984e0) and rc are read;
-    the chain stops before step [2] if the payload did not answer 14.02
+Why this build exists
+  The previous run completed the kernel chain, the patch set, the padding pde
+  write and the version-probe redirect, printed
+      [kp] version probe aimed at 0xffffffff8b933000
+  and then the console died in the 400 ms idle window that follows -- before
+  the trampoline was even built, i.e. before any kpayload call was fired. Two
+  suspects remain: (a) the pde write / RELRO plant machinery itself, and
+  (b) the 641-byte patchset's 0x125791 block, whose writes decode as
+  incoherent code at the 14.02 sites in our own kernel dump. 1402zk removes
+  both from the path and tests one new thing only: step 1 of the kpayload.
+
+What changed in afterglow-g.js
+  - probe BYPASS, not redirect: 0x115be (the "s/release_" scan) early-outs
+    whenever the word at image+0x98488 is nonzero, and 19 payload sites call
+    it. The build presets that word to 0x57a in userland and calls the table
+    fill 0x116be directly with edi=0x57a -- byte for byte the continuation a
+    successful probe produces. The scan window that starts in the unmapped
+    hole at base+0x1300000 is never read.
+  - runPatchSet, paddingRW, the planted version string, the two scan-patch
+    writes and the switch to the RELRO padding as a ring-0 stack are all
+    skipped. The payload call runs on the syscall's own kernel stack with rsp
+    aligned to 16 and the old rsp parked in the 16 bytes below the call.
+  - KP_MAX_STEPS=1: step 1 is 0x116be (the old 0x11bd1 entry minus its probe
+    prelude). After it returns, STATE.haltChain stops the chain before the
+    debug-settings pass, and three idle heartbeats print over ~2.6 s.
+  - step 1 result is checked exactly: rc must be 0, word 0x98488 must still be
+    0x57a, and table[0] at image+0x986f8 must equal kbase+0x1c0 (the first
+    dword of the 14.02 fill is 0x1c0).
+  - a gate heartbeat (k.base(), the same body every k.read/k.write already
+    ran) is printed immediately before the fire.
+
+Expected on-screen order (1402zk)
+  [kp] 642888 bytes inflated kpayload
+  [kp] gate page executes in ring 3
+  [kp] kpayload staged at 0x..., .bss cleared
+  [kp] version word preset to 0x57a -- the ring-0 scan never runs
+  [kp] kernel base 0x..., payload at 0x... -- patchset and padding pde skipped this build
+  [kp] gate heartbeat 0x..., firing step 1 next
+  [kp] SYNC entering [1] 0x116be init: import/offset tables (probe bypassed) (host stack)
+  [kp] [1] rc=0 -- init: import/offset tables (probe bypassed)
+  [kp] version word 0x57a, table[0] 0x... -- matches base+0x1c0
+  [kp] step 1 returned cleanly -- 1402zk stops the chain here on purpose
+  [kp] idle heartbeat 1 of 3 after step 1
+  [kp] idle heartbeat 2 of 3 after step 1
+  [kp] idle heartbeat 3 of 3 after step 1
+  [kp] still alive after the idle window -- step 1 is clean
+  [kp] 1402zk diagnostic build -- stopping before the debug-settings pass
+
+How to read the next crash (if there is one)
+  - last line before "SYNC entering [1]": the console died in an idle window
+    with no payload call yet. The pde/plant/patchset removal was not enough;
+    the instability is in the state afterglow itself leaves behind.
+  - last line is "SYNC entering [1]" (after its 400 ms paint window): the
+    first payload call faulted in ring 0. Report the exact rc/mismatch line if
+    one appears.
+  - death during "idle heartbeat 1..3": step 1 returned but left the kernel
+    unstable -- that points at the table contents, not at the call.
+  - "table[0] ... MISMATCH": the fill did not run as expected; the printed
+    value tells which base/offset arithmetic failed.
 
 Kernel-state interlock
   Before any trigger the run asks whether mprotect can add PROT_EXEC to a
@@ -24,25 +69,10 @@ Kernel-state interlock
   A page reload, a Rest Mode resume or a SceShellUI restart all keep the
   patched kernel; only a full power-off clears it.
 
-  go-check.html   safe check only: prints
-                  "AG probe kernel-state: ... rv=0 ... PATCHED" or "FRESH"
+  go-check.html   safe check only: prints "... PATCHED" or "... FRESH"
                   with no trigger and no patches
   go-force.html   opt-in bypass for a boot you know is clean (force=1).
                   Firing twice on a patched kernel panics the console.
 
-Expected on-screen order
-  [kp] kernel base ..., padding ...
-  [g] patchset.bin loaded ... -- calling gate
-  [g] [0] kernel patch set, ... -> 0x...
-  [kp] patch set call returned
-  [rw] dmap ..., pml4 ... confirmed against kernel_pmap
-  [rw] RW+X set on the pd entry at ..., dmap ...
-  [kp] version probe aimed at 0x...11ff000
-  [kp] SYNC entering [1] 0x11bd1 ...
-  [kp] [1] 0x11bd1 rc=0 -- ...
-  [kp] payload reports version 0x57a, table word 0x...
-  [kp] SYNC entering [2] ...
-
-If it stops, the last [rw] or [kp] line names the failed check.
 Do not use on a console you cannot afford to crash; test only with owner
 permission. Capture the full on-screen log.

