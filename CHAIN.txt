@@ -1,36 +1,122 @@
-afterglow 14.02 chain - working snapshot 2026-11-11 (diag rev 5)
+afterglow 14.02 chain - working snapshot 2026-11-11 (diag rev 8)
 ==================================================
-Cache version : 1402zm
+Cache version : 1402zp
 State         : kernel exploit WORKS on 14.02 (uid 0, kernel R/W, patches in
-                place, handles defused, syscall-11 gate live). The 1402zl run
-                staged the kpayload, printed "tram built (82 bytes), firing
-                now" and died inside the next 250 ms paint window, before the
-                SYNC line -- with no payload call made. 1402zm removes the
-                only thing that ran in that window and fires one frame later.
+                place, handles defused, syscall-11 gate live). 1402zn added a
+                DEBUG-SETTINGS STOP TEST; 1402zp moves the kpayload image out
+                of the staging mapping and into the kernel text padding after
+                the 0x116be crash was traced to page-level ring-0 execution.
 
-What 1402zm changes (details in DIAGNOSTIC_NOTES.txt)
-  - ZERO-GARBAGE STAGING. The 642,888-byte copy and the .bss clear built a
-    fresh int64 for the address and for the value every 8 bytes, about 100k
-    iterations. This int64 class installs ~12 closures per instance, so the
-    burst left millions of short-lived cells, and the first idle collection
-    after it is exactly where 1402zl stopped painting. Both the cursor and the
-    word are now mutated in place; the primitive reads low/hi and its own
-    path allocates nothing.
-  - FIRE FIRST, IDLE LATER. 1402zl spent 300+250+250+400 ms in naps between
-    the gate heartbeat and the call. 1402zm builds the tram straight after
-    the heartbeat and lets a single 120 ms frame paint the heartbeat, tram
-    and SYNC lines, then calls. rc is painted immediately after the return.
-  - DEADMAN CLOCK in the status line, "ALIVE <s> | <phase>", repainted every
-    100 ms by its own timer. Whatever it shows at a crash is the last moment
-    the main thread was alive; the phase names the last line that got there.
-  - Shifted patches print the live bytes at the ORIGINAL 14.00 offset, and
-    [7b] lines now reach the server log (ag_log).
-  - Kernel work identical to 1402zl: probe bypass (word at image+0x98488
-    preset to 0x57a, 0x116be called directly with edi=0x57a), no patchset.bin,
-    no paddingRW pde write, no planted string, no kernel-padding stack switch,
-    payload runs on the syscall's own kernel stack, KP_MAX_STEPS=1.
+What 1402zp changes vs 1402zo (details in DIAGNOSTIC_NOTES.txt)
+  - ROOT CAUSE OF THE 0x116be CRASH: the fresh mmap is executable page by
+    page, and only the trampoline page (+0x47c40) has ever been proven in
+    ring 0. This file already records the measurement: a three-byte probe on
+    page 0 of a fresh mapping took the console down (02.11, 14:27). The
+    kpayload driver called image+0x116be at buf+0x616be -- a page no ring-3 or
+    ring-0 code had ever executed -- so the first instruction fetch was the
+    crash. Nothing in map_functions itself is wrong.
+  - The staged image now goes where the stock loader put GoldHEN: the kernel
+    text padding at kbase+0x10ff000, one RW+X 2 MiB page
+    (0x10ff000..0x11ff000) that the loader drove 636 KB from on this
+    firmware. paddingRW() flips the PDE; the far end of the copy is written
+    and read back BEFORE the rep movsb; the copy goes through the dmap alias
+    and the step calls t+0x116be on a stack at t+0xff000 -- the stock 1402
+    kpayload driver's exact shape.
+  - The host-stack dance is gone. The step runs on a dedicated stack at
+    t+0xff000, the top of the padding window, exactly as the stock 1402
+    kpayload driver ran it.
+  - The userland staging mapping is now only the copy source. Nothing in it
+    is executed except the trampoline page, as before.
+  - Same single step (0x116be, edi=0x57a), same zero-garbage staging, same
+    version-word preset, same .bss clear, same one-ring-0-call-per-boot rule.
 
-Expected patch lines
+What 1402zo adds vs 1402zn (details in DIAGNOSTIC_NOTES.txt)
+  - THE 14.02 CRASH WAS NOT AT THE HAND-OFF. The run that ended at
+    "PROOF-OK syscall-page-needs-stub" showed nothing from afterglow because
+    afterglow does not yield between its first line and its first ring-0
+    shot, so none of its DOM lines had ever painted. The screen was showing
+    the jb stage's last frame while the console died later, inside a
+    synchronous stretch.
+  - The deadman clock now starts at the first afterglow line and is painted
+    by a 150 ms forced frame before any kernel work. New phases: pre: stubs,
+    pre: stubs seeded, pre: pinned core N, pre: interlock clear, pre: gadgets
+    ok, pre: shooter ready.
+  - Forced frames bracket both early kernel shots: "FIRE leak shot", "leak
+    returned", "FIRE scan shot", "scan returned". Whatever the status line
+    reads at a freeze now names the step that was running.
+  - jb-g.js paints "handing over to afterglow..." and yields 150 ms before
+    the dynamic import, so even a death during module load leaves a phase.
+  - No kernel behaviour change: same gate, same [7b] pass, same uid-0 path,
+    same teardown, same dbgstop disarm.
+
+What 1402zn changes vs 1402zm (details in DIAGNOSTIC_NOTES.txt)
+  - NEW mode=dbgstop (entry page go-dbg.html). No payload is loaded, no kpayload
+    step chain, no dump. The chain reaches the rcmgr debug-menu pass, patches
+    the permission check to "mov eax,1; ret", READS THE BYTES BACK to verify,
+    then restores sysent[11].sy_call and prints the safe-stop banner. After
+    that, nothing else runs: no final messages, no dumps, no payload.
+  - GATE DISARM. The bootstrap now stashes the original sysent[11].sy_call in
+    the header NOP pad at kbase+0xab8 before it plants the gate at 0xab4.
+    dbgstop writes those bytes back to kbase+0x1102d88 / 0x1102d8c and reads
+    them back inside the same ring-0 entry, so syscall 11 returns to its real
+    handler before the page stops. Closing the browser then has no
+    `jmp [rsi]` left to hit. Bootstrap is 156 bytes (0x9c); the gate stub
+    starts at 0xa0 -- four bytes spare, do not grow it without moving GATE.
+  - jb-g.js now clears its 45 s watchdog and the 500 ms RAM box interval once
+    the afterglow chain returns, so the page cannot grow a fake "exploit
+    failed - please retry" notice while the user walks to Settings.
+  - rcmgr pass reports every failure point instead of silently returning:
+      [dbg] rcmgr_debug_menu string not found in text
+      [dbg] rcmgr_debug_menu string tail mismatch
+      [dbg] oid_name pointer not found in data
+      [dbg] oid_name handler pointer is null
+      [dbg] oid_name handler outside text
+      [dbg] handler read failed
+      [dbg] no CALL+TEST in handler
+      [dbg] rcmgr patch write did not stick
+  - Everything from 1402zm stays: zero-garbage staging, fire-first paint
+    window, deadman clock, [7b] shift reports with live bytes.
+
+How mode=dbgstop is meant to end
+  On success the screen shows, in order:
+      ...normal chain lines...
+      [8] N of N confirmed kernel patches in place
+      [9] jailbroken, uid 0
+      [10] kernel interface is live -- ... handles held open
+      [t] ... teardown lines, then "handles defused"
+      debug menu enabled -- go to Settings
+      [gate] syscall 11 disarmed -- sy_call restored to 0xffffffff9...
+      ========================================
+        DEBUG MENU PATCH CONFIRMED -- SAFE STOP
+        Open Settings and look for Debug Settings.
+        No payload was loaded; nothing else will run.
+        The syscall-11 gate is disarmed too -- exit is safe.
+        You can close the browser now. Cold boot when done.
+      ========================================
+  and the status line freezes at "STOPPED -- SAFE TO EXIT".
+  That is the whole run. The page then does nothing at all.
+
+  What to check on the console
+    1. Status line reads STOPPED -- SAFE TO EXIT and the [gate] line names a
+       0xffffffff9... address.
+    2. Open Settings and look for the Debug Settings entry (usually at the
+       bottom of the Settings list on a patched 14.02).
+    3. Come back to the browser, close it with the normal buttons.
+    4. Report what you saw. If it still panics on exit, syscall 11 was not the
+       cause -- send the full log, including the [gate] line.
+
+  If the patch did not stick you get
+      [dbg] rcmgr patch write did not stick
+      [dbg] DEBUG MENU PATCH FAILED -- nothing more will run
+      status "STOPPED -- PATCH FAILED"
+  and nothing else; the gate is still disarmed, so exit stays safe.
+
+  If the gate could not be restored (no stash, bad pointer, write did not
+  stick) the banner says "WARNING: the syscall-11 gate is still armed" and
+  the status freezes at "STOPPED -- GATE STILL ARMED". The debug menu patch
+  is still in place; only browser exit is risky.
+
+Expected chain lines (unchanged from 1402zm)
   [7b] N sites confirmed, M left untouched
   [7b] SKIP <name> @0x<off> live <12 bytes>       (one per untouched site)
   [7b] <name> shifted +<n> -> 0x<off+n>  (0x<off> live <6 bytes>)
@@ -39,17 +125,16 @@ Expected patch lines
   the firmware moved, and writing them blind is what killed the 1402zk run.
 
 How to read the next crash
-  - clock "ALIVE ... | FIRE [1] 0x116be" and SYNC on screen: the payload call
-    was entered and did not come back -- a ring-0 fault inside the payload,
-    and the last log line names the step.
-  - clock stopped at an earlier phase, before FIRE: the page still dies
-    during staging with no payload call made; the value says how long after
-    the gate it happened.
+  - clock "ALIVE ... | FIRE [1] 0x116be" and SYNC on screen: a ring-0 call
+    was entered and did not come back; the last log line names the step.
+    (kpstep path only; dbgstop never fires the payload.)
+  - clock stopped at an earlier phase, before the rcmgr pass: the page died
+    during the chain; the phase names the last line that got there.
   - clock keeps counting but no new log lines: the main thread is alive and
     something else is stuck. Note the value and report it.
-  - rc=0 printed, then the console dies during the heartbeats: step 1
-    returned and the kernel went down afterwards. The four heartbeats bracket
-    when.
+  - clock frozen at "STOPPED -- SAFE TO EXIT" is the normal end of dbgstop.
+  - clock frozen at "STOPPED -- GATE STILL ARMED": the rcmgr work finished
+    but the gate could not be put back; do not close the page, power off.
 
 Kernel-state interlock
   Before any trigger the run asks whether mprotect can add PROT_EXEC to a
@@ -66,7 +151,8 @@ One armed run per boot. Full power cycle between attempts - a reload says
 "this kernel is already open / Not firing again".
 
 Entry pages
-  index.html / go.html  full chain, mode=kpstep (this build)
+  index.html / go.html  full chain, mode=kpstep (payload step 1, stops early)
+  go-dbg.html  full chain, mode=dbgstop (debug menu patch + gate disarm, stop)
   go-k.html    kernel only, no payload
   go-s.html / go-z.html  kpayload step chain variants
   go-g.html    goldhen-1402.bin via pthread loader (dies after thread start)
@@ -78,6 +164,6 @@ Payloads
   hen.bin           500,448 B  composite image for the pthread path
 
 patchset.bin : 14.02 corrected, md5 3f9b0fe9d643b28b9ff5f9ac19e74598
-               NOT called by 1402zm (its 0x125xxx block is still a suspect)
+               NOT called by this build (its 0x125xxx block is still a suspect)
 site         : serve from this folder, python3 server.py (port 1337,
                Cache-Control: no-store, /ag_log answers 200, log in serve.log)
