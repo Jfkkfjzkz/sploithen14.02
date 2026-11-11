@@ -1,6 +1,6 @@
 @echo off
 :: ============================================================
-::  NanospeedGamer -- PS4 14.00 / 14.02 exploit host
+::  SploitHen 14.02 -- PS4 14.00 / 14.02 exploit host
 ::
 ::  Usage:
 ::    serve.bat            (port 8000)
@@ -18,7 +18,7 @@ if not "%~1"=="" set PORT=%~1
 cd /d "%~dp0"
 
 echo.
-echo  NanospeedGamer exploit host
+echo  SploitHen 14.02 exploit host
 echo  ----------------------------
 
 :: ── Detect Python ─────────────────────────────────────────────────────────

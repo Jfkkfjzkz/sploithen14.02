@@ -57,5 +57,5 @@ http
     });
   })
   .listen(port, "0.0.0.0", function () {
-    console.log("afterglow on http://0.0.0.0:" + port + "/  (ctrl-c to stop)");
+    console.log("SploitHen 14.02 on http://0.0.0.0:" + port + "/  (ctrl-c to stop)");
   });
