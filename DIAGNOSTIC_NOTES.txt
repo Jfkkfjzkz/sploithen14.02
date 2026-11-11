@@ -1,0 +1,5 @@
+Diagnostic build only. Original payload binaries and memory patches are unchanged.
+Changes: honest payload status; pthread_create return code and handle logged.
+A created thread does NOT confirm HEN initialization.
+Do not use on a console you cannot afford to crash; test only with owner permission.
+Capture the full on-screen log and whether Debug Settings/HEN actually works.

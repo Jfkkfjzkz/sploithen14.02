@@ -1,110 +1,129 @@
-# afterglow (web)
+# Akatsuki Clan ☁ — PS4 14.00 / 14.02 Jailbreak Host
 
-Kernel exploit for the PlayStation 4 on firmware **14.00**, run from the
-console's own browser. It leaves the kernel readable and writable, `uid 0`,
-`mmap` handing out RWX and `syscall 11` as a kexec gate — so the usual payloads
-work as they do after any other kernel exploit.
+> **For PS4 firmware 14.00 and 14.02 only.**  
+> Run from your PC on the same network as the console. Nothing is installed on the PS4.
 
-This is the browser version. The same exploit also runs as a Lua payload from
-inside a game process.
+---
 
-## You need
+## What This Is
 
-* PS4 on firmware 14.00, on your network
-* A machine on the same network with `python3`
+A local HTTP server that delivers the **afterglow** kernel exploit to your PS4's browser.  
+Once the exploit runs, the kernel is left readable/writable with `uid 0` — standard payloads  
+(ps4-hen, GoldHEN) load from there.
 
-Nothing is installed on the console. The pages are static files.
+Custom additions on top of the base exploit:
 
-## Running it
+- **Hacker theme** — black/red/green Matrix aesthetic, glitch-title, ASCII art dragon
+- **Key authentication** — the PS4 URL requires a `?key=XXXX` token; the browser keeps  
+  it via cookie, so CSS/JS assets load fine after the initial redirect
+- **Admin panel** — web UI to generate labeled access keys, copy PS4-ready URLs, and  
+  revoke keys; a fresh admin key prints to your terminal on every server start
 
-```sh
-./serve.sh                      # port 8000, or AFTERGLOW_PORT=8080 ./serve.sh
-node serve.js                   # same rules; use this on a host without python3
+---
+
+## Requirements
+
+- Windows PC (or any machine with Python 3)
+- PS4 on firmware **14.00** or **14.02**, on the same Wi-Fi/LAN
+- Python 3.6+ — download at <https://python.org/downloads>  
+  *(tick "Add Python to PATH" during install)*
+
+---
+
+## Quick Start
+
+1. Put the whole folder somewhere on your PC (e.g. `C:\AkatsukiAIM\14.02 Jailbreak\`)
+2. Double-click **`serve.bat`**
+3. The terminal prints two URLs — copy the **PS4 URL** (includes the key)
+4. On your PS4: open the browser and enter that URL, then press **START**
+5. Done. GoldHEN / ps4-hen loads.
+
+---
+
+## Admin Panel
+
+When the server starts it prints something like:
+
+```
+  Admin panel : http://192.168.1.x:8000/admin?ak=a1b2c3d4e5f6g7h8
+  PS4 URL     : http://192.168.1.x:8000/?key=ab12cd34ef
 ```
 
-Open `http://<host>:8000/` in the console's browser, pick **ps4-hen** or
-**GoldHEN**, press start. Tick *autostart* and it goes by itself after five
-seconds.
+Open the **Admin panel** URL in any browser on your PC. From there you can:
 
-Each run has to begin on that page. The run page arms the chain only when it
-was reached from there, so a browser restoring its last session cannot set it
-off again with nobody watching.
+- Generate new access keys with a custom label (e.g. "living room PS4")
+- Copy the full PS4 URL for each key (ready to type or scan as QR)
+- Revoke keys you no longer need
+- See how many times each key has been used
 
-## What is shipped
+> **Note:** The admin key changes every time you restart the server.  
+> Access keys persist until you revoke them or restart.
 
-| File | What it is |
+---
+
+## Files
+
+| File | Purpose |
 |---|---|
-| `goldhen-1402.bin` | GoldHEN 14.02 release loader — 291,925-byte raw payload (leading `e9`), the default the page launches |
-| `payload.bin` | debug build of the same loader, 297,931 bytes, kept for the gated step log |
-| `hen.bin` | ps4-hen `pre-release-main-182`, **already patched** (see below) |
-| `goldhen.bin` | GoldHEN, included with the author's permission |
-| `patchset.bin` | 641 bytes of kernel patches GoldHEN expects to find |
-| `afterglow.js`, `patchset.bin` | this work |
-| `jb.js`, `core.js`, `mem.js`, `int64.js`, `ps4_offsets.js` | from the raw13g host, trimmed |
+| `serve.bat` | Windows launcher — detects Python, checks everything, starts the server |
+| `server.py` | Custom Python HTTP server: key auth, cookie sessions, admin API |
+| `index.html` | PS4 browser landing page (Akatsuki Clan theme) |
+| `style.css` | Hacker theme — black/red, green Matrix rain, glitch title |
+| `matrix.js` | Matrix rain canvas animation |
+| `launch.js` | PS4 exploit launcher (countdown → start button → fires exploit) |
+| `afterglow-g.js` | Afterglow exploit — GoldHEN path |
+| `core.js` / `mem.js` | Exploit primitives |
+| `int64.js` | 64-bit integer helpers |
+| `ps4_offsets.js` | Firmware 14.00/14.02 kernel offsets |
+| `hen.bin` | ps4-hen (patched — wrong `sceSblPfsSetKeys` fixed for 14.00) |
+| `goldhen.bin` | GoldHEN |
+| `patchset.bin` | Kernel patches GoldHEN expects |
+| `kernel_1402.bin` | 14.02-specific kernel payload |
+| `serve.sh` | Linux/macOS alternative to serve.bat |
 
-The entry pages (`/`, `go.html`, `go-s.html`) redirect to
-`launch.html?...&afterglow=run&mode=goldhen&payload=goldhen-1402.bin`, so the
-default run is afterglow's gated raw-loader path with the release binary. The
-selector is content-based (`loadEnabler`): a file of exactly 964,440 bytes takes
-the composite patch chain, a leading `e9` takes the raw loader. `mode=kpstep`
-still drives the inflated kpayload one call at a time. The M_TEMP slot is read
-out of the loader's own `mov rsi,[rip+disp32]` at `0x182d`, so both builds work
-without a per-build table.
+---
 
-### ps4-hen is patched here
+## Hosting Note
 
-Upstream `hen.bin` has a wrong address for `sceSblPfsSetKeys` on 14.00.
-Unpatched, **every app launch freezes the console** and the kernel stays broken
-until you reboot. The copy in this folder already carries the fix:
+> GitHub Pages serves **static files only** — `server.py` does not run there.  
+> The key-auth and admin panel require a real Python server on a local PC.  
+>
+> **To jailbreak your PS4, run `serve.bat` on a PC on the same network.**  
+>
+> This repo is for backup, version control, and easy re-download.
 
-```sh
-md5sum hen.bin                  # 6417a84a72f9c7988f0e33b3ae190542  (patched)
-                                # 9aff7544eddef2f8202f72fc633d2be3  = upstream, do not use
-```
+---
 
-If you bring your own build, change `kpayload/source/offsets/1400.c`,
-`sceSblPfsSetKeys_addr` from `0x006272B0` to `0x00627270`. Why, and how it was
-established: `TECHNICAL.md`.
+## ps4-hen Patch Note
 
-## If it stops
+Upstream `hen.bin` has a wrong `sceSblPfsSetKeys` address on 14.00 — unpatched,  
+every app launch after jailbreak freezes the console. The copy here is already fixed.  
+See `TECHNICAL.md` for details.
 
-The page tells you which of these happened.
+---
 
-| What it says | What it cost | What to do |
+## Troubleshooting
+
+| Symptom | Cause | Fix |
 |---|---|---|
-| `exploit failed - please retry (reopen browser)` | nothing — no apm unit spent, no kernel byte written | reopen the browser and go again |
-| nothing at all, for 45 s | same | the watchdog says the same thing; if even that does not appear, the WebProcess is gone — cold start |
-| `the handles are NOT defused` | the chain got far and could not clean up | **do not close the browser** — cold start |
+| `serve.bat` opens and closes instantly | Python not on PATH | Install Python 3, tick "Add Python to PATH", restart |
+| PS4 page loads but looks plain | Stale cookie / browser cache | Close and reopen PS4 browser, re-enter URL with key |
+| `exploit failed — please retry` | Normal — no damage done | Reopen browser, go again |
+| `the handles are NOT defused` | Chain got far, couldn't clean up | **Cold-start the console** (don't just close browser) |
+| Console dies with no message | Heap race — normal failure rate | Cold start and retry |
 
-That last one matters. With the handles left armed, the next process exit runs
-`fo_close` into `apmclose` and never completes — and closing the browser *is*
-that exit, so no browser restart will help afterwards.
-
-There is also a failure that cannot be caught. The reclaimed object supplies
-the stack pointer, and the kernel reads it before a single instruction of ours
-runs. When some other kernel allocation wins the hole instead, ring 0 carries
-on with a stack pointer out of a stranger's object and the console dies right
-there — no message, no clean shutdown. Don't run this with anything unsaved on
-the console.
-
-## Reviews wanted
-
-Issues and pull requests welcome, and so is a report that it simply worked. Say
-which model and firmware you tried.
+---
 
 ## Credits
 
-* **raw13g** — the host this page grew out of
-* **jordyidk** — [slopkit](https://github.com/jordyidk/slopkit)
-* **al-azif** — <https://github.com/al-azif/>
-* **SiSTRo** — GoldHEN
-* **TheFlow, ChendoChap, abc, AlAzif, LightningMods, @egycnq** — the PS4 kernel
-  patch and sandbox escape lineage these payloads build on
-* everyone who publishes their findings instead of sitting on them
+- **raw13g** — exploit substrate  
+- **jordyidk** — [slopkit](https://github.com/jordyidk/slopkit)  
+- **al-azif** — <https://github.com/al-azif/>  
+- **SiSTRo** — GoldHEN  
+- **TheFlow, ChendoChap, abc, AlAzif, LightningMods, @egycnq** — kernel exploit lineage  
+- **iDntUseModz** — Akatsuki Clan theme, key auth system, admin panel
 
 ## Legal
 
-Security research on hardware we own. No Sony code is redistributed.
-
-Licensed under the GNU Affero General Public License v3.0 or later. The raw13g
-substrate keeps its own license.
+Security research on hardware we own. No Sony code redistributed.  
+Licensed under the GNU Affero General Public License v3.0 or later.
