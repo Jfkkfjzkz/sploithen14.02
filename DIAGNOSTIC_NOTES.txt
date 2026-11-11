@@ -1,66 +1,88 @@
-Diagnostic build 1402zk. Payload binaries and memory offsets are unchanged;
-only afterglow-g.js and the entry pages differ from the previous zip. This is
-one new ring-0 call per boot, by design.
+Diagnostic build 1402zl. Payload binaries and memory offsets are unchanged;
+only afterglow-g.js and the entry pages differ from 1402zk. This is one new
+ring-0 call per boot, by design.
 
 Why this build exists
-  The previous run completed the kernel chain, the patch set, the padding pde
-  write and the version-probe redirect, printed
-      [kp] version probe aimed at 0xffffffff8b933000
-  and then the console died in the 400 ms idle window that follows -- before
-  the trampoline was even built, i.e. before any kpayload call was fired. Two
-  suspects remain: (a) the pde write / RELRO plant machinery itself, and
-  (b) the 641-byte patchset's 0x125791 block, whose writes decode as
-  incoherent code at the 14.02 sites in our own kernel dump. 1402zk removes
-  both from the path and tests one new thing only: step 1 of the kpayload.
+  The 1402zk run printed
+      [kp] gate heartbeat 0xffffffffccf50000, firing step 1 next
+  and the console died ~2 s later, with the SYNC line never painted. Since
+  say() paints synchronously and nap() yields to the compositor, the death
+  happened either in the 300 ms idle nap after the heartbeat or during the
+  host-side trampoline build -- before fire(), not inside the payload.
+
+  The prime suspect is a real port bug now proven from our own 14.02 dump:
+  the [7b] resolver searched the shift list for a confirming instruction, and
+  when it found none it still let [8] write the 14.00 bytes at the 14.02
+  offset. Six sites have no branch there at all, so those writes landed
+  mid-instruction:
+      0x1b7504  `90 e9` inside a `lea`       -> wild jmp
+      0x628684  `eb 00` inside a `lea`       -> bzero buffer pointer corrupted
+      0x1b7a53  displacement tail of `je` at 0x1b7a4f -> wild jump
+  A system path that touches dlsym/load_prx or self-verification after the
+  chain completes would then jump into garbage -- exactly the kind of death
+  that arrives a beat after the last painted line.
 
 What changed in afterglow-g.js
-  - probe BYPASS, not redirect: 0x115be (the "s/release_" scan) early-outs
-    whenever the word at image+0x98488 is nonzero, and 19 payload sites call
-    it. The build presets that word to 0x57a in userland and calls the table
-    fill 0x116be directly with edi=0x57a -- byte for byte the continuation a
-    successful probe produces. The scan window that starts in the unmapped
-    hole at base+0x1300000 is never read.
-  - runPatchSet, paddingRW, the planted version string, the two scan-patch
-    writes and the switch to the RELRO padding as a ring-0 stack are all
-    skipped. The payload call runs on the syscall's own kernel stack with rsp
-    aligned to 16 and the old rsp parked in the 16 bytes below the call.
-  - KP_MAX_STEPS=1: step 1 is 0x116be (the old 0x11bd1 entry minus its probe
-    prelude). After it returns, STATE.haltChain stops the chain before the
-    debug-settings pass, and three idle heartbeats print over ~2.6 s.
-  - step 1 result is checked exactly: rc must be 0, word 0x98488 must still be
-    0x57a, and table[0] at image+0x986f8 must equal kbase+0x1c0 (the first
-    dword of the 14.02 fill is 0x1c0).
-  - a gate heartbeat (k.base(), the same body every k.read/k.write already
-    ran) is printed immediately before the fire.
+  - the patch resolver now builds applyList/skipped:
+      * a site already equal to the wanted bytes is applied;
+      * a site whose live instruction is a safe jcc is applied -- for "eb"
+        any short jcc (0x70..0x7f) of the same length, for "eb04" the same
+        short jcc with displacement 0x04, for "90e9" any 0f-prefixed jcc --
+        because forcing a branch only requires landing on a branch;
+      * otherwise the shift list is searched (16..1280 bytes) for a site
+        that does confirm; a hit is applied at the shifted address;
+      * otherwise the site is SKIPped, never written, and its 12 live bytes
+        are printed: [7b] SKIP <name> @0x<off> live <hex>.
+  - [8] verifies applyList only and prints "N of N confirmed kernel patches
+    in place". N can be less than 15; that is the fix, not a failure.
+  - two paint checkpoints were inserted so the silent stretch after the gate
+    heartbeat is split into named windows:
+      [kp] idle window spent, building tram      (+ 250 ms nap)
+      [kp] tram built (<n> bytes), firing now    (+ 250 ms nap)
+  - unchanged from 1402zk: probe bypass (image+0x98488 preset to 0x57a,
+    0x116be called directly with edi=0x57a), no patchset.bin, no paddingRW
+    pde write, no planted string, no kernel-padding stack switch, payload on
+    the syscall's own kernel stack, KP_MAX_STEPS=1, exact step-1 checks
+    (rc=0, version word 0x57a, table[0] == kbase+0x1c0).
 
-Expected on-screen order (1402zk)
+Expected on-screen order (1402zl)
   [kp] 642888 bytes inflated kpayload
   [kp] gate page executes in ring 3
   [kp] kpayload staged at 0x..., .bss cleared
   [kp] version word preset to 0x57a -- the ring-0 scan never runs
+  [7b] N sites confirmed, M left untouched
+  [7b] SKIP ... (one line per moved site, with live bytes)
+  [8] N of N confirmed kernel patches in place
   [kp] kernel base 0x..., payload at 0x... -- patchset and padding pde skipped this build
   [kp] gate heartbeat 0x..., firing step 1 next
+  [kp] idle window spent, building tram
+  [kp] tram built (<n> bytes), firing now
   [kp] SYNC entering [1] 0x116be init: import/offset tables (probe bypassed) (host stack)
   [kp] [1] rc=0 -- init: import/offset tables (probe bypassed)
   [kp] version word 0x57a, table[0] 0x... -- matches base+0x1c0
-  [kp] step 1 returned cleanly -- 1402zk stops the chain here on purpose
+  [kp] step 1 returned cleanly -- 1402zl stops the chain here on purpose
   [kp] idle heartbeat 1 of 3 after step 1
   [kp] idle heartbeat 2 of 3 after step 1
   [kp] idle heartbeat 3 of 3 after step 1
   [kp] still alive after the idle window -- step 1 is clean
-  [kp] 1402zk diagnostic build -- stopping before the debug-settings pass
+  [kp] 1402zl diagnostic build -- stopping before the debug-settings pass
 
 How to read the next crash (if there is one)
-  - last line before "SYNC entering [1]": the console died in an idle window
-    with no payload call yet. The pde/plant/patchset removal was not enough;
-    the instability is in the state afterglow itself leaves behind.
-  - last line is "SYNC entering [1]" (after its 400 ms paint window): the
-    first payload call faulted in ring 0. Report the exact rc/mismatch line if
-    one appears.
+  - last line "gate heartbeat ... firing step 1 next": death in the 300 ms
+    idle nap. The kernel is unstable without any payload call and with no
+    blind patch writes -- report it, this narrows the hunt to the gate itself.
+  - last line "idle window spent, building tram": death while writing the
+    trampoline/marker words from the host. The host primitive is the suspect.
+  - last line "tram built (...), firing now": death in the 250 ms window
+    before the syscall. Nothing new ran; that points at residual kernel state.
+  - last line "SYNC entering [1]": the first payload call faulted in ring 0.
+    Report the exact rc/mismatch line if one appears.
   - death during "idle heartbeat 1..3": step 1 returned but left the kernel
     unstable -- that points at the table contents, not at the call.
   - "table[0] ... MISMATCH": the fill did not run as expected; the printed
     value tells which base/offset arithmetic failed.
+  - a SKIP line with surprising live bytes is useful too: it pins down where
+    the 14.02 code moved relative to 14.00.
 
 Kernel-state interlock
   Before any trigger the run asks whether mprotect can add PROT_EXEC to a

