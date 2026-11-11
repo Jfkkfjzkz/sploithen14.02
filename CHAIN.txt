@@ -1,30 +1,33 @@
-afterglow 14.02 chain - working snapshot 2026-11-11
+afterglow 14.02 chain - working snapshot 2026-11-11 (diag rev 2)
 ==================================================
-Cache version : 1402zh
+Cache version : 1402zi
 State         : kernel exploit WORKS on 14.02 (uid 0, kernel R/W, 15/15 patches,
                 handles defused, console stays alive). Debug Settings patch lands:
-                last clean run printed "debug menu enabled" and CHAIN COMPLETE.
-                HEN/GoldHEN services (9090/2121) still under bisect.
+                last clean kernel-only run printed "debug menu enabled".
+                kpayload step chain under test; see DIAGNOSTIC_NOTES.txt.
+
+Prime suspect for the step-chain crash (fixed in this build)
+  The 14.02 relayout left a hole: RELRO memsz ends at base+0x12ff000 and the RW
+  segment starts at base+0x1520000.  The kpayload's version probe reads
+  [base+0x1300000, base+0x2200000) byte by byte, so its first read is in that
+  hole -- a ring 0 read of an unmapped byte is a panic with no log.  This build
+  redirects the probe to a planted string in the unused RELRO tail.
 
 One armed run per boot. Full power cycle between attempts - a reload says
 "this kernel is already open / Not firing again".
 
 Entry pages
+  index.html / go.html  full chain, mode=kpstep (this build)
   go-k.html    kernel only, no payload
-  go-tt3.html  thread-context proof (marker written by the payload, read back)
-  go-i1.html   HEN installer init #1 only, then spin (SURVIVED on hardware)
-  go-i2.html   HEN installer init #1+#2, then spin (bisect step)
-  go-pr.html   yush libPS4 pthread create/join probe, output captured to a buffer
+  go-s.html / go-z.html  kpayload step chain variants
   go-g.html    goldhen-1402.bin via pthread loader (dies after thread start)
-  go-gc.html   clean loader run (no hardcoded patches)
-  others: go-gb, go-gd, go-ge, go-p, go-z, go-tt, go-tt2
+  others: go-gb, go-gc, go-gd, go-i1, go-i2, go-p, go-pr, go-tt, go-tt2, go-tt3
 
 Payloads
+  kpayload.bin      642,888 B  14.02 GoldHEN kpayload, 0x57a table present
   goldhen-1402.bin  291,925 B  ported GoldHEN, 14.02 table (loader verified)
-  thread-probe.bin  yush probe build, md5 49e9129976f0b734a64030346e585986
-  thread-test.bin   16 KB marker write + spin
-  hen-init1.bin / hen-init2.bin  installer bisect stubs
+  hen.bin           500,448 B  composite image for the pthread path
 
-patchset.bin : 14.02, md5 ef106363b8d9836e4dc03601bc42e720
+patchset.bin : 14.02 corrected, md5 3f9b0fe9d643b28b9ff5f9ac19e74598
 site         : serve from this folder, python3 server.py (port 1337,
                Cache-Control: no-store, /ag_log answers 200, log in serve.log)

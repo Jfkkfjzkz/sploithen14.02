@@ -1,5 +1,35 @@
-Diagnostic build only. Original payload binaries and memory patches are unchanged.
-Changes: honest payload status; pthread_create return code and handle logged.
-A created thread does NOT confirm HEN initialization.
-Do not use on a console you cannot afford to crash; test only with owner permission.
-Capture the full on-screen log and whether Debug Settings/HEN actually works.
+Diagnostic build. Payload binaries and memory offsets are unchanged; only
+afterglow-g.js and patchset.bin differ from the previous zip.
+
+What changed
+  - timer yield after each stage's log line, so the screen paints it before the
+    ring 0 call that follows (a resolved promise does not repaint)
+  - runPatchSet logs before and after the syscall-11 gate call
+  - paddingRW logs every check and yields before the page-directory write
+  - kpayload .bss (>= 0x98380) zeroed as a real loader would; the flat copy had
+    left the section-name table there
+  - version probe redirect: the payload scans [base+0x1300000, base+0x2200000)
+    for "s/release_", but RELRO memsz ends at base+0x12ff000, so the first byte
+    it reads is unmapped. The build plants "s/release_14.02" at
+    base+0x11ff000 (unused RELRO tail, made RW+X by paddingRW) and patches the
+    scan to [0x11ff000, 0x11ff010). The patch is applied only after the two
+    payload instructions are byte-verified against their expected form.
+  - after step [1], version (0x98488), table pointer (0x984e0) and rc are read;
+    the chain stops before step [2] if the payload did not answer 14.02
+
+Expected on-screen order
+  [kp] kernel base ..., padding ...
+  [g] patchset.bin loaded ... -- calling gate
+  [g] [0] kernel patch set, ... -> 0x...
+  [kp] patch set call returned
+  [rw] dmap ..., pml4 ... confirmed against kernel_pmap
+  [rw] RW+X set on the pd entry at ..., dmap ...
+  [kp] version probe aimed at 0x...11ff000
+  [kp] SYNC entering [1] 0x11bd1 ...
+  [kp] [1] 0x11bd1 rc=0 -- ...
+  [kp] payload reports version 0x57a, table word 0x...
+  [kp] SYNC entering [2] ...
+
+If it stops, the last [rw] or [kp] line names the failed check.
+Do not use on a console you cannot afford to crash; test only with owner
+permission. Capture the full on-screen log.
