@@ -100,20 +100,20 @@ const BOOTSTRAP =
 
 const PATCHES = [
   [0x0000acd, "eb",       "bcopy"],
-  [0x02bd79d, "eb",       "bzero"],
-  [0x02bd7e1, "eb",       "pagezero"],
-  [0x02bd85d, "eb",       "memcpy"],
-  [0x02bd8a1, "eb",       "pagecopy"],
-  [0x02bda4d, "eb",       "copyin"],
-  [0x02bdefd, "eb",       "copyinstr"],
-  [0x02bdfcd, "eb",       "copystr"],
+  [0x02bda9d, "eb",       "bzero"],
+  [0x02bdae1, "eb",       "pagezero"],
+  [0x02bdb5d, "eb",       "memcpy"],
+  [0x02bdba1, "eb",       "pagecopy"],
+  [0x02bdd4d, "eb",       "copyin"],
+  [0x02be1fd, "eb",       "copyinstr"],
+  [0x02be2cd, "eb",       "copystr"],
   [0x01b7a43, "eb04",     "dlsym, first check"],
   [0x01b7a53, "eb04",     "dlsym, second check"],
   [0x01b7a73, "90e9",     "dlsym, nop and jump"],
   [0x01b7504, "90e9",     "load_prx"],
   [0x01b7ab8, "90e93c01", "dlsym, open it to every caller"],
   [0x0628684, "eb00",     "self verification"],
-  [0x0628f6f, "eb00",     "delayed panic on suspend"],
+  [0x062926f, "eb00",     "delayed panic on suspend"],
 ];
 
 /* ------------------------------------------------------------- the host */
@@ -2343,7 +2343,10 @@ async function attempt(ctx, opts) {
       if (nb[0] === 0x90 && nb.length > 1 && nb[1] === 0xE9) expect1 = 0x0F;
 
       if (expect1 < 0) continue;
-      if (cur && cur[0] === expect1) continue;
+      /* 14.02 compiles these stack-overlap checks as jbe (76) instead of
+         jne (75). Same meaning, same site: patching here is correct, so do
+         not go hunting for a shift that will never exist. */
+      if (cur && (cur[0] === expect1 || (expect1 === 0x75 && cur[0] === 0x76))) continue;
 
       let best = -1;
       for (let s = 0; s < SHIFTS.length; s++) {
