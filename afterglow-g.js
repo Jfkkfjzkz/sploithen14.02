@@ -1825,6 +1825,25 @@ export function probeAfterglow(ctx) {
   out.stubs = noStub.length ? ("missing " + noStub.join(",")) : "all resolved";
   if (noStub.length) no("no libkernel stub for syscall " + noStub.join(","));
 
+  /* The same question the run's interlock asks, reported instead of acted on:
+     on a clean boot a writable mapping refuses PROT_EXEC; after a successful
+     run it accepts it. No trigger, no patch, nothing is fired here. */
+  try {
+    const m0 = sc(S.mmap, 0, 0x4000, 3, 0x1002, -1, 0);
+    if (m0.i32 === -1) {
+      say("probe kernel-state: mmap refused, errno " + host().errno());
+    } else {
+      const rv = sc(S.mprotect, v(m0.lo, m0.hi), 0x4000, 7).i32;
+      const uid = sc(S.getuid).i32;
+      out.rwx = "mprotect rv=" + rv + " uid=" + uid;
+      say("probe kernel-state: mmap ok, mprotect RWX rv=" + rv + ", uid=" + uid + " -- "
+          + (rv === 0 ? "PATCHED: a run has already succeeded on this boot"
+                      : "FRESH: the run's interlock will let it proceed"));
+    }
+  } catch (e) {
+    say("probe kernel-state: failed: " + (e && e.message ? e.message : e));
+  }
+
   let lib = findLib("libSceLibcInternal.sprx");
   if (!lib.base) {
     const m = findLibByShape();
@@ -1971,6 +1990,7 @@ async function attempt(ctx, opts) {
   STATE.ctx = ctx;
   opts = opts || {};
   STATE.retry = false;
+  const force = !!(ctx.params && ctx.params.get("force"));
   say("afterglow -- ps4 kernel exploit, firmware 14.00 / 14.02 (raw13 host)");
 
   const missing = seedStubs();
@@ -1998,10 +2018,16 @@ async function attempt(ctx, opts) {
      successful run. */
   {
     const m0 = sc(S.mmap, 0, 0x4000, 3, 0x1002, -1, 0);
-    if (m0.i32 !== -1 && sc(S.mprotect, v(m0.lo, m0.hi), 0x4000, 7).i32 === 0) {
-      say("  this kernel is already open -- a run has succeeded on this boot.");
-      say("  Not firing again; reboot the console for a fresh one.");
-      return false;
+    if (m0.i32 !== -1) {
+      const rv = sc(S.mprotect, v(m0.lo, m0.hi), 0x4000, 7).i32;
+      if (rv === 0) {
+        const uid = sc(S.getuid).i32;
+        say("  this kernel is already open -- mprotect RWX succeeded, uid=" + uid + ".");
+        say("  A run has succeeded on this boot; a page reload or Rest Mode does not clear it.");
+        say("  Turn the console fully off, power it on, then retry.");
+        if (!force) { say("  Not firing again."); return false; }
+        say("  force=1 given -- firing anyway against a kernel that is already patched.");
+      }
     }
   }
 

@@ -17,6 +17,19 @@ What changed
   - after step [1], version (0x98488), table pointer (0x984e0) and rc are read;
     the chain stops before step [2] if the payload did not answer 14.02
 
+Kernel-state interlock
+  Before any trigger the run asks whether mprotect can add PROT_EXEC to a
+  writable mapping. A clean boot refuses it; after a successful run it is
+  accepted, and the run stops instead of firing twice into a patched kernel.
+  A page reload, a Rest Mode resume or a SceShellUI restart all keep the
+  patched kernel; only a full power-off clears it.
+
+  go-check.html   safe check only: prints
+                  "AG probe kernel-state: ... rv=0 ... PATCHED" or "FRESH"
+                  with no trigger and no patches
+  go-force.html   opt-in bypass for a boot you know is clean (force=1).
+                  Firing twice on a patched kernel panics the console.
+
 Expected on-screen order
   [kp] kernel base ..., padding ...
   [g] patchset.bin loaded ... -- calling gate
