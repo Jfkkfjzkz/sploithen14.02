@@ -3,6 +3,43 @@ afterglow-g.js now copies the staged kpayload image into the kernel text
 padding and calls it there instead of executing it from the staging mmap.
 This is still one new ring-0 call per boot, by design.
 
+Package fix10: the testers' run log (no exploit change)
+  Two reports came back from other consoles: an "insufficient memory" loop,
+  and a crash after the chain started. Neither left a log, and this is why:
+  the server.py shipped in fix8/fix9 was built for a Linux box -- it hardcoded
+  ROOT=/home/mc/ag1402 and port 1337 and ignored serve.bat's port, so on a
+  tester's PC it served from a folder that does not exist (every request was
+  a 404) and it listened on 1337 while serve.bat printed 8000. The ag_log
+  lines the page sends were 404s wherever a plain http.server was used.
+
+  fix10 keeps 1402zp untouched and fixes the host:
+    - server.py serves the folder it lives in and honours the port argument.
+    - server.py, serve.js and serve.sh append every request line and every
+      /ag_log?m=... line to serve.log next to the server. The page already
+      forwards each afterglow line ([kp]/[rw]/status) to ag_log; now those
+      lines persist even if the console freezes on the next call.
+    - serve.log is a normal file, so a tester can open
+      http://<their-pc>:<port>/serve.log and send it. It also records which
+      page and which ?v= version was fetched, which names the build that ran.
+
+  The "insufficient memory" loop is NOT from this chain. It is the console
+  browser's own out-of-memory page, shown during the WebKit stage when the
+  renderer cannot allocate; the console has not crashed and needs no reboot.
+  A browser app that has been open through several attempts keeps the low
+  memory, and every reopen hits it again -- that is the loop. Close the
+  browser application itself (PS button, Close Application), close any game,
+  then reopen; if it still shows, power-cycle and run the page first. The
+  auto-reload (up to 4 benign read misses, sessionStorage) adds reloads on a
+  memory-tight renderer, which makes it look worse.
+
+  The crash group cannot be placed without a last line. If they ran fix9 or
+  the LAN build, the log will now name the step; if they ran an older zip or
+  the Pages copy (still 1402zm), the old crash at FIRE [1] 0x116be is the
+  known pre-1402zp one. Every report to chase should include the screen's
+  last status line and serve.log. A hard WebKit miss can also freeze a
+  console before any [kp] line -- that risk lives in the WebKit stage and is
+  unchanged by 1402zp; the last line tells the two apart.
+
 1402zp: the 0x116be crash is the page, not the function
   The 1402zm run froze at
       ALIVE 4.76 s | FIRE [1] 0x116be

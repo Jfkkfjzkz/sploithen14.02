@@ -7,6 +7,22 @@ State         : kernel exploit WORKS on 14.02 (uid 0, kernel R/W, patches in
                 of the staging mapping and into the kernel text padding after
                 the 0x116be crash was traced to page-level ring-0 execution.
 
+Package fix10 (same 1402zp chain, host only)
+  - The server.py in fix8/fix9 was a Linux leftover: ROOT=/home/mc/ag1402,
+    fixed port 1337, serve.bat's port ignored. On a tester's PC it served
+    from a folder that does not exist and listened on the wrong port, so
+    tester runs left no trace anywhere.
+  - server.py now serves its own folder and honours the port argument, and
+    server.py, serve.js and serve.sh append every request line and every
+    /ag_log?m=... line to serve.log beside the server. The page already sends
+    each afterglow line to ag_log, so a freeze now leaves the last [kp]/[rw]
+    line in serve.log; the request lines name the page and ?v= version.
+  - serve.log is served as a plain file: http://<pc>:<port>/serve.log.
+  - No JS, payload or offset changed. One new ring-0 call per boot, same
+    safety rules. The "insufficient memory" loop some testers saw is the
+    console browser's own OOM page in the WebKit stage -- close the browser
+    application and reopen, do not keep reloading the tab.
+
 What 1402zp changes vs 1402zo (details in DIAGNOSTIC_NOTES.txt)
   - ROOT CAUSE OF THE 0x116be CRASH: the fresh mmap is executable page by
     page, and only the trampoline page (+0x47c40) has ever been proven in
