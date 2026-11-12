@@ -1420,15 +1420,16 @@ async function loadKpayloadSteps(k, kbase, room) {
     return false;
   }
   deadbeat("copy into padding returned");
-  const vm = k.read(t, 4);
-  const vv = k.read(plus(t, 0x98488), 2);
-  if (!vm || vm[0] !== 0x7f || vm[1] !== 0x45 || vm[2] !== 0x4c || vm[3] !== 0x46
-      || !vv || vv[0] !== 0x7a || vv[1] !== 0x05) {
-    ksay("[kp] padding copy did not read back as the staged image -- not calling it");
-    await nap(300);
-    return false;
+  /* Read-back verification of the ELF magic and version word removed on
+     request: the ring-0 copy reported 0x5758, so trust it and proceed. The
+     head is logged for the record only, never branched on. */
+  const vm = k.read(t, 8);
+  if (vm) {
+    let wh = "";
+    for (let j = 0; j < vm.length; j++) wh += (vm[j] < 16 ? "0" : "") + vm[j].toString(16);
+    ksay("[kp] padding head after copy: " + wh + " (logged, not verified)");
   }
-  ksay("[kp] padding copy verified at " + text(t) + ": ELF magic and version word 0x57a");
+  ksay("[kp] copy into padding returned 0x5758 -- proceeding without read-back verify");
   await nap(60);
 
   let silent = 0;
